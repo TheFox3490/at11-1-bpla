@@ -110,7 +110,7 @@ class WorldScene:
         self.rig = DroneRig()
         self.trail_points: list[Vec3] = []
         self.trail_mesh = Mesh(vertices=[Vec3(0, 0, 0), Vec3(0, 0, 0)],
-                               mode="line", thickness=2)
+                               mode="line", thickness=3)
         self.trail = Entity(model=self.trail_mesh, color=color.rgb32(255, 210, 70))
         self.plumb = Entity(model="cube", scale=(0.02, 1, 0.02),
                             color=color.rgba32(255, 235, 120, 200))
@@ -189,7 +189,7 @@ class WorldScene:
         self.plumb.position = (pos.x, alt / 2, pos.z)
         self.spot.position = (pos.x, 0.012, pos.z)
         self.spot.rotation_z = -self.rig.root.rotation_y
-        flat = Vec3(pos.x, 0.02, pos.z)
+        flat = Vec3(pos.x, 0.035, pos.z)
         if not self.trail_points or (flat - self.trail_points[-1]).length() > 0.04:
             self.trail_points.append(flat)
             if len(self.trail_points) >= 2:
