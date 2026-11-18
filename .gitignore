@@ -9,3 +9,6 @@ state/
 data/layout.json
 data/textures/class_*.png
 data/textures/route_*.png
+# Arial is copied from C:\Windows\Fonts at start-up; do not redistribute it.
+fonts/*.ttf
+spike/fonts/
