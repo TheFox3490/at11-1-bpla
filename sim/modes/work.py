@@ -136,13 +136,13 @@ class WorkMode(Mode):
                              tint=ui.MUTED))
         self.priority_text = self.add_ui(ui.label(None, "—", (-0.042, -0.362),
                                                   scale=0.42, tint=ui.INK))
-        self.add_ui(ui.button(None, "◀", (0.058, -0.362), scale=(0.032, 0.030),
+        self.add_ui(ui.button(None, "←", (0.058, -0.362), scale=(0.032, 0.030),
                               text_size=0.42, on_click=lambda: self.cycle_target(-1)))
         self.add_ui(ui.button(None, "P−", (0.098, -0.362), scale=(0.036, 0.030),
                               text_size=0.42, on_click=lambda: self.bump_priority(-1)))
         self.add_ui(ui.button(None, "P+", (0.138, -0.362), scale=(0.036, 0.030),
                               text_size=0.42, on_click=lambda: self.bump_priority(+1)))
-        self.add_ui(ui.button(None, "▶", (0.178, -0.362), scale=(0.032, 0.030),
+        self.add_ui(ui.button(None, "→", (0.178, -0.362), scale=(0.032, 0.030),
                               text_size=0.42, on_click=lambda: self.cycle_target(+1)))
         self.replan_btn = self.add_ui(ui.button(
             None, "Пересчитать", (0.310, -0.362), scale=(0.120, 0.030),
