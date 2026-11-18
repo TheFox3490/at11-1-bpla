@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -493,8 +494,9 @@ def main() -> None:
         if args.only:
             only = [part.strip().upper() for part in args.only.split(",") if part.strip()]
         code = run_cli(APP, only)
+        sys.stdout.flush()
         base.userExit()
-        sys.exit(code)
+        os._exit(code)
 
     if args.selftest:
         run_selftest(APP)
