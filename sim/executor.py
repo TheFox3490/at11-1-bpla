@@ -20,7 +20,7 @@ from shared.journal import ActionRegistry, Journal
 from shared.world import (
     ALT_MIN, ALT_MAX, ALT_NOMINAL, EXEC_LIMIT_SECONDS, FORBIDDEN_EXPANSION,
     HOME, OPERATION_SECONDS, SPEED_LIMIT, STABILIZE_SECONDS, TARGET_RADIUS,
-    distance_to_polygon,
+    distance_to_polygon, expand_polygon, point_in_poly, segment_intersects_polygon,
 )
 from sim.drone import Drone
 
@@ -92,6 +92,9 @@ class ExecutorRun:
             self._fail("планировщик не построил маршрут")
             return
         self.route_f = [(float(p["x"]), float(p["y"])) for p in self.plan["route"]]
+        if not self._route_is_safe():
+            self._fail("маршрут пересекает расширенную запретную зону")
+            return
         self.route_l = [self.frame.to_local(x, y) for x, y in self.route_f]
         for target in self.plan["targets"]:
             key = self._key(target["point"]["x"], target["point"]["y"])
@@ -99,6 +102,14 @@ class ExecutorRun:
         self.journal.log("mission_loaded", mission_id=self.mission.get("mission_id"),
                          mission_path=str(self.mission_path), targets=len(self.plan["targets"]),
                          route_points=len(self.route_f), local_frame=self.frame.name)
+
+    def _route_is_safe(self) -> bool:
+        """Defence in depth: the file may have been edited after planning."""
+        expanded = expand_polygon(_zone_vertices(self.mission), FORBIDDEN_EXPANSION)
+        for a, b in zip(self.route_f, self.route_f[1:]):
+            if segment_intersects_polygon(a, b, expanded):
+                return False
+        return True
 
     @staticmethod
     def _key(x: float, y: float) -> tuple[int, int]:
@@ -215,6 +226,14 @@ class ExecutorRun:
         if self.t > EXEC_LIMIT_SECONDS:
             self._fail("превышен лимит времени исполнителя")
             return
+
+        if self.phase in {"cruise", "stabilize", "led", "to_home"}:
+            if point_in_poly(self.drone.x, self.drone.y, _zone_vertices(self.mission)):
+                self.drone.rig.set_led(False)
+                self.journal.log("forbidden_zone_violation", t_s=round(self.t, 3),
+                                 x=round(self.drone.x, 3), y=round(self.drone.y, 3))
+                self._fail("дрон вошёл в запретную зону")
+                return
 
         if self.phase == "led":
             self.led_time += dt

@@ -6,6 +6,7 @@ is the file handed to the executor.
 """
 from __future__ import annotations
 
+import copy
 from datetime import datetime, timedelta
 
 from cv.merge import Observation
@@ -94,3 +95,23 @@ def build_mission(observations: list[Observation], run_id: str,
     }
     payload["checksum"] = checksum_of(payload)
     return payload, rejected
+
+
+def apply_subset(mission: dict, plan_result: dict, budget_s: float) -> dict:
+    """Return a mission document containing only the feasible subset.
+
+    The planner already dropped targets with a recorded reason; this copies
+    that decision into the mission file itself, so the executor never sees
+    targets that do not fit the budget (task A4 / scenario C8).
+    """
+    skipped = [dict(item) for item in (plan_result.get("skipped") or [])]
+    out = copy.deepcopy(mission)
+    if skipped:
+        dropped = {item["target_id"] for item in skipped}
+        out["targets"] = [t for t in out["targets"] if t["target_id"] not in dropped]
+    out["budget_s"] = round(float(budget_s), 1)
+    out["partial"] = bool(skipped)
+    out["skipped"] = skipped
+    out.pop("checksum", None)
+    out["checksum"] = checksum_of(out)
+    return out

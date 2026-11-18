@@ -19,7 +19,11 @@ from shared.world import HFOV, IMG_H, IMG_W
 
 class FrameGrabber:
     def __init__(self, hide_entities):
-        self.hide_entities = [e for e in hide_entities if e is not None]
+        # Either a list or a callable returning the current overlays; the route
+        # preview and other entities are created after startup, so resolving
+        # the list at capture time keeps them out of the frames.
+        self._hide_source = hide_entities
+        self._hidden: list = []
         self.busy = False
         self.armed = False
         self.last_path: Path | None = None
@@ -27,6 +31,10 @@ class FrameGrabber:
         self._saved = None
         self._crop = None
         self._path: Path | None = None
+
+    def _collect_hidden(self) -> list:
+        source = self._hide_source() if callable(self._hide_source) else self._hide_source
+        return [entity for entity in source if entity is not None]
 
     def arm(self, pose: dict, path: str | Path) -> bool:
         """Point the camera and request a capture on the next rendered frame."""
@@ -39,12 +47,13 @@ class FrameGrabber:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         ui = camera.ui
+        self._hidden = self._collect_hidden()
         self._saved = (
             Vec3(camera.position), tuple(camera.rotation), camera.fov,
-            ui.visible, [e.visible for e in self.hide_entities],
+            ui.visible, [e.visible for e in self._hidden],
         )
         ui.visible = False
-        for e in self.hide_entities:
+        for e in self._hidden:
             e.visible = False
 
         w, h = base.win.getXSize(), base.win.getYSize()
@@ -95,8 +104,9 @@ class FrameGrabber:
         camera.rotation = rot
         camera.fov = fov
         camera.ui.visible = ui_visible
-        for e, v in zip(self.hide_entities, vis):
+        for e, v in zip(self._hidden, vis):
             e.visible = v
+        self._hidden = []
         self._saved = None
 
     def cancel(self) -> None:

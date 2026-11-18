@@ -21,14 +21,14 @@ import cv2
 from cv.calibration import Calibration, CalibrationError, calibrate, pixel_to_local
 from cv.detect import detect_plots
 from cv.merge import merge_detections
-from cv.mission import build_mission, observation_map
+from cv.mission import apply_subset, build_mission, observation_map
 from cv.planner import plan
 from cv.validator import validate_mission
 from shared.contracts import (
     iso, parse_iso, read_json, utc_now, write_json,
 )
 from shared.frames import apply_similarity
-from shared.world import HOME, NO_FLY
+from shared.world import EXEC_LIMIT_SECONDS, HOME, NO_FLY
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNS_DIR = PROJECT_ROOT / "runs"
@@ -53,6 +53,7 @@ class PipelineResult:
     calibration: dict | None = None
     rejected: list = field(default_factory=list)
     duration_s: float = 0.0
+    full_mission: dict | None = None
 
 
 def _progress(cb: Callable[[str, float], None] | None, stage: str, fraction: float) -> None:
@@ -75,7 +76,8 @@ def _image(run_dir: Path, meta: dict):
 
 
 def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | None = None,
-                 mission_dir: str | Path | None = None) -> PipelineResult:
+                 mission_dir: str | Path | None = None,
+                 budget_s: float = EXEC_LIMIT_SECONDS) -> PipelineResult:
     started = time.time()
     run_dir = Path(run_dir)
     mission_dir = Path(mission_dir) if mission_dir else MISSIONS_DIR
@@ -141,29 +143,35 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
     _progress(progress, "построение миссии", 0.88)
     mission, rejected = build_mission(observations, run_id, calib_version,
                                       last_frame_at=last_capture)
+    full_mission = mission
     mission_path = mission_dir / f"{mission['mission_id']}.json"
-    # Keep an in-run copy for the report even if validation fails.
+    # Keep the unmodified CV output for re-planning in the UI.
+    write_json(run_dir / "mission_full.json", full_mission)
     write_json(run_dir / "mission_candidate.json", mission)
-    write_json(mission_path, mission)
 
     planning = {"start": {"x": HOME[0], "y": HOME[1]}, "order": [], "targets": [],
                 "route": [], "length_m": 0.0, "estimated_s": 0.0,
                 "reserve_s": 0.0, "total_with_reserve_s": 0.0,
-                "method": "none", "comparison": {}, "skipped": [],
-                "expanded_forbidden": [], "valid": False}
+                "method": "none", "comparison": [], "skipped": [],
+                "expanded_forbidden": [], "valid": False,
+                "budget_s": round(float(budget_s), 1)}
     if mission["targets"]:
-        planning = plan(HOME, mission["targets"], forbidden=NO_FLY)
+        planning = plan(HOME, mission["targets"], forbidden=NO_FLY,
+                        max_time=budget_s)
+        if planning.get("skipped"):
+            mission = apply_subset(full_mission, planning, budget_s)
+            write_json(run_dir / "mission_candidate.json", mission)
         write_json(run_dir / "plan.json", planning)
+    write_json(mission_path, mission)
 
     errors = validate_mission(mission)
     if not mission["targets"]:
         errors.append("no_targets_in_mission")
     if mission["targets"] and not planning.get("valid"):
         errors.append("planner_failed")
-    if planning.get("skipped"):
-        errors.append("planner_skipped_targets")
     errors = sorted(set(errors))
     valid = not errors
+    partial = bool(planning.get("skipped"))
 
     latest = mission_dir / "latest_valid.json"
     if valid:
@@ -176,6 +184,8 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
         "run_id": run_id,
         "finished_at": iso(),
         "valid": valid,
+        "partial": partial,
+        "budget_s": round(float(budget_s), 1),
         "validation_errors": errors,
         "calibration_version": calib_version,
         "calibration": calibration.as_dict(),
@@ -186,6 +196,7 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
             "A": counts["A"], "B": counts["B"], "U": counts["U"],
             "mission_targets": len(mission["targets"]),
             "rejected": len(rejected),
+            "skipped": len(planning.get("skipped") or []),
         },
         "observations": [o.as_dict() for o in observations],
         "rejected": rejected,
@@ -193,7 +204,8 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
         "mission_path": str(mission_path),
         "plan": {k: planning.get(k) for k in
                  ("order", "route", "length_m", "estimated_s", "reserve_s",
-                  "total_with_reserve_s", "method", "comparison", "skipped", "valid")},
+                  "total_with_reserve_s", "method", "chosen_method", "comparison",
+                  "skipped", "valid", "budget_s")},
     }
     report_path = write_json(run_dir / "report.json", report)
     _progress(progress, "готово", 1.0)
@@ -204,14 +216,16 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
         plan=planning, report=report, report_path=str(report_path),
         observations=observations, calibration=calibration.as_dict(),
         rejected=rejected, duration_s=round(time.time() - started, 3),
+        full_mission=full_mission,
     )
     return result
 
 
-def run_pipeline_safe(run_dir: str | Path, progress=None) -> dict:
+def run_pipeline_safe(run_dir: str | Path, progress=None,
+                      budget_s: float = EXEC_LIMIT_SECONDS) -> dict:
     """Thread-friendly wrapper returning JSON-ish data and an error string."""
     try:
-        result = run_pipeline(run_dir, progress=progress)
+        result = run_pipeline(run_dir, progress=progress, budget_s=budget_s)
         return {
             "ok": True,
             "result": result,

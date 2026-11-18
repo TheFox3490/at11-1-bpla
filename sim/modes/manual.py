@@ -1,9 +1,12 @@
-"""Mode 2: full manual map work (training only).
+"""Mode 2: field layout editor (the polygon the drones will see).
 
-Everything here is deliberately manual: the operator places, moves, prioritises
-and deletes objects, validates the map and generates a mission.  The banner in
-the panel states that hand-entered coordinates are not allowed in the official
-scenario; mode 3 is the official recon -> CV -> executor path.
+The operator draws the plots that the simulator renders on the ground.  The
+edits are a draft until "Применить к полю" is pressed; applying changes the
+physical field and drops any mission built for the previous layout.
+
+This is not a way to hand coordinates to the executor: mode 3 still derives
+the mission only from the recon frames (task 1.2).  The manual mission button
+stays as a training aid and is marked as such.
 """
 from __future__ import annotations
 
@@ -19,64 +22,70 @@ from shared.contracts import checksum_of, iso, new_id, utc_now, write_json
 from shared.world import (
     FIELD_H, FIELD_W, MAP_TTL_SECONDS, NO_FLY, RECON_ERROR,
 )
-from sim import ui
+from sim import scenario, ui
 from sim.modes.base import Mode
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 MANUAL_MISSIONS = PROJECT_ROOT / "missions" / "manual"
 
-CLASS_COLORS = {"A": color.rgb32(226, 62, 62),
-                "B": color.rgb32(56, 104, 226),
-                "U": color.rgb32(190, 190, 190)}
+CLASS_COLORS = {"A": color.rgba32(226, 62, 62, 190),
+                "B": color.rgba32(56, 104, 226, 190),
+                "U": color.rgba32(190, 190, 190, 190)}
 CLASS_NAMES = {"A": "A · треугольник", "B": "B · круг", "U": "U · не определено"}
+FIELD_PAD = 0.27
 
 
 class ManualMarker:
+    """Small translucent handle drawn over the plot texture."""
+
     def __init__(self, root: Entity, obj: dict):
         self.obj = obj
-        self.ring = Entity(parent=root, model="sphere",
-                           scale=(0.58, 0.012, 0.58),
-                           position=(obj["x"], 0.026, obj["y"]),
-                           color=color.rgb32(248, 248, 248), visible=False)
+        self.halo = Entity(parent=root, model="sphere",
+                           scale=(0.50, 0.006, 0.50),
+                           position=(obj["x"], 0.008, obj["y"]),
+                           color=color.rgba32(248, 248, 248, 110), visible=False)
         self.disc = Entity(parent=root, model="sphere",
-                           scale=(0.38, 0.018, 0.38),
-                           position=(obj["x"], 0.032, obj["y"]),
+                           scale=(0.11, 0.010, 0.11),
+                           position=(obj["x"], 0.012, obj["y"]),
                            color=CLASS_COLORS[obj["klass"]])
-        self.core = Entity(parent=root, model="sphere", scale=0.055,
-                           position=(obj["x"], 0.055, obj["y"]),
+        self.core = Entity(parent=root, model="sphere", scale=0.035,
+                           position=(obj["x"], 0.024, obj["y"]),
                            color=color.rgb32(20, 20, 20))
 
     def sync(self, selected: bool) -> None:
         x, y = self.obj["x"], self.obj["y"]
-        self.ring.position = (x, 0.026, y)
-        self.disc.position = (x, 0.032, y)
-        self.core.position = (x, 0.055, y)
+        self.halo.position = (x, 0.008, y)
+        self.disc.position = (x, 0.012, y)
+        self.core.position = (x, 0.024, y)
         self.disc.color = CLASS_COLORS.get(self.obj["klass"], color.white)
-        self.ring.visible = selected
-        self.ring.scale = (0.62, 0.012, 0.62) if selected else (0.58, 0.012, 0.58)
+        self.halo.visible = selected
+        self.halo.scale = (0.54, 0.006, 0.54) if selected else (0.50, 0.006, 0.50)
 
     def destroy(self) -> None:
-        destroy(self.ring)
+        destroy(self.halo)
         destroy(self.disc)
         destroy(self.core)
 
 
 class ManualMode(Mode):
     name = "manual"
-    title = "2 · РУЧНАЯ КАРТА"
+    title = "2 · КОНСТРУКТОР ПОЛЯ"
     role = "neutral"
 
     def __init__(self, app):
         super().__init__(app)
-        self.objects: list[dict] = []
+        self.objects: list[dict] = scenario.copy_objects(app.layout)
+        self.applied: list[dict] = scenario.copy_objects(app.layout)
         self.markers: dict[str, ManualMarker] = {}
-        self.next_index = 1
         self.selected: dict | None = None
         self.current_class = "A"
         self.drag: dict | None = None
         self._was_left = False
         self._was_right = False
         self._hover_point: tuple[float, float] | None = None
+        self._active = False
+        self.dirty = False
+        self.layout_errors: list[str] = []
         self.mission_path: str | None = None
         self.mission: dict | None = None
         self.mission_valid = False
@@ -86,17 +95,18 @@ class ManualMode(Mode):
         self.marker_root = Entity(name="manual_markers")
         self.marker_root.enabled = False
         self._build_ui()
+        self._rebuild_markers()
 
     # ------------------------------------------------------------------ #
     def _build_ui(self) -> None:
         self.add_ui(ui.panel(position=(-0.645, -0.02), scale=(0.43, 0.84),
                              tint=ui.PANEL, name="manual_panel"))
-        self.add_ui(ui.label(None, "РУЧНАЯ КАРТА", (-0.84, 0.375),
-                             scale=0.78, tint=ui.ACCENT))
-        self.add_ui(ui.label(None, "УЧЕБНЫЙ РЕЖИМ\nручные координаты недопустимы\nв официальном сценарии",
-                             (-0.84, 0.315), scale=0.50, tint=ui.WARN))
+        self.add_ui(ui.label(None, "КОНСТРУКТОР ПОЛЯ", (-0.84, 0.375),
+                             scale=0.74, tint=ui.ACCENT))
+        self.add_ui(ui.label(None, "правки меняют полигон\nдля режима 3 · координаты\nдаёт только CV",
+                             (-0.84, 0.315), scale=0.48, tint=ui.WARN))
         self.add_ui(ui.label(None, "КЛАСС ОБЪЕКТА", (-0.84, 0.205),
-                             scale=0.55, tint=ui.MUTED))
+                             scale=0.53, tint=ui.MUTED))
 
         self.class_buttons = {}
         for i, klass in enumerate("ABU"):
@@ -106,26 +116,39 @@ class ManualMode(Mode):
                           name=f"class_{klass}")
             self.class_buttons[klass] = self.add_ui(b)
 
-        self.add_ui(ui.label(None, "ПРИОРИТЕТ И УДАЛЕНИЕ", (-0.84, 0.09),
-                             scale=0.50, tint=ui.MUTED))
-        self.add_ui(ui.button(None, "P −", (-0.80, 0.045), scale=(0.14, 0.038),
+        self.add_ui(ui.label(None, "ПРИОРИТЕТ / УДАЛЕНИЕ", (-0.84, 0.095),
+                             scale=0.48, tint=ui.MUTED))
+        self.add_ui(ui.button(None, "P −", (-0.80, 0.052), scale=(0.13, 0.038),
                               text_size=0.55, on_click=lambda: self.bump_priority(-1)))
-        self.add_ui(ui.button(None, "P +", (-0.645, 0.045), scale=(0.14, 0.038),
+        self.add_ui(ui.button(None, "P +", (-0.655, 0.052), scale=(0.13, 0.038),
                               text_size=0.55, on_click=lambda: self.bump_priority(+1)))
-        self.add_ui(ui.button(None, "Удалить", (-0.49, 0.045), scale=(0.15, 0.038),
-                              text_size=0.52, danger=True, on_click=self.delete_selected))
+        self.add_ui(ui.button(None, "Удалить", (-0.50, 0.052), scale=(0.15, 0.038),
+                              text_size=0.50, danger=True, on_click=self.delete_selected))
 
-        self.add_ui(ui.button(None, "Проверить карту", (-0.645, -0.02),
-                              scale=(0.36, 0.043), on_click=self.validate_map_ui))
-        self.add_ui(ui.button(None, "Сгенерировать миссию", (-0.645, -0.075),
-                              scale=(0.36, 0.043), on_click=self.generate_mission))
+        self.add_ui(ui.label(None, "ПОЛИГОН ДЛЯ РЕЖИМА 3", (-0.84, 0.005),
+                             scale=0.48, tint=ui.MUTED))
+        self.apply_btn = self.add_ui(ui.button(
+            None, "Применить к полю", (-0.645, -0.038),
+            scale=(0.36, 0.045), text_size=0.58, tint=ui.BUTTON_ACTIVE,
+            on_click=self.apply_to_field, name="manual_apply_btn"))
+        self.add_ui(ui.button(None, "Базовая", (-0.795, -0.088),
+                              scale=(0.13, 0.036), text_size=0.47,
+                              on_click=self.load_demo_map))
+        self.add_ui(ui.button(None, "С поля", (-0.645, -0.088),
+                              scale=(0.13, 0.036), text_size=0.47,
+                              on_click=self.revert_to_applied))
+        self.add_ui(ui.button(None, "Очистить", (-0.495, -0.088),
+                              scale=(0.145, 0.036), text_size=0.45,
+                              danger=True, on_click=self.clear_map))
+
+        self.add_ui(ui.button(None, "Проверить карту", (-0.645, -0.132),
+                              scale=(0.36, 0.040), on_click=self.validate_map_ui))
+        self.add_ui(ui.button(None, "Учебная миссия", (-0.645, -0.178),
+                              scale=(0.36, 0.038), on_click=self.generate_mission))
         self.launch_btn = self.add_ui(ui.button(
-            None, "Запустить исполнитель", (-0.645, -0.13),
-            scale=(0.36, 0.043), on_click=self.launch_executor))
-        self.add_ui(ui.button(None, "Очистить карту", (-0.645, -0.185),
-                              scale=(0.36, 0.038), danger=True,
-                              on_click=self.clear_map))
-        self.status = self.add_ui(ui.label(None, "", (-0.84, -0.235), scale=0.52,
+            None, "Запустить исполнитель", (-0.645, -0.222),
+            scale=(0.36, 0.038), on_click=self.launch_executor))
+        self.status = self.add_ui(ui.label(None, "", (-0.84, -0.262), scale=0.50,
                                            tint=ui.INK))
 
         self.add_ui(ui.panel(position=(0.63, -0.02), scale=(0.46, 0.84),
@@ -136,7 +159,8 @@ class ManualMode(Mode):
                                                tint=ui.INK))
 
         self.add_ui(ui.label(
-            None, "ЛКМ — поставить / выбрать и перетащить · ПКМ — удалить · 1/2/3 — класс",
+            None, "ЛКМ — поставить / выбрать и перетащить · ПКМ — удалить · "
+            "1/2/3 — класс · синяя рамка — зона калибровки",
             (0.0, -0.467), origin=(-0.5, 0.5), scale=0.55, tint=ui.MUTED))
 
     # ------------------------------------------------------------------ #
@@ -145,20 +169,31 @@ class ManualMode(Mode):
         camera.rotation = (90, 0, 0)
         camera.fov = 86.0
         mouse.locked = False
+        self._active = True
         self.app.scene.set_overlays(True)
+        self.app.scene.set_calibration_zone_visible(True)
         self.marker_root.enabled = True
         self.app.drone.reset()
         self.app.drone.rig.set_role("neutral")
         self.app.scene.clear_trail()
+        self._preview()
         self._sync_markers()
         self.validate_map_ui()
 
     def on_exit(self) -> None:
+        self._active = False
         self.marker_root.enabled = False
+        self.app.scene.set_calibration_zone_visible(False)
         self.drag = None
         self._was_left = False
+        # The draft is only a preview; the physical field is what was applied.
+        self.app.scene.set_layout(self.applied)
         if self.app.execution is not None and self.app.execution_source is self:
             self.app.cancel_execution()
+
+    def _preview(self) -> None:
+        if self._active:
+            self.app.scene.set_layout(self.objects)
 
     # ------------------------------------------------------------------ #
     def set_class(self, klass: str) -> None:
@@ -168,19 +203,19 @@ class ManualMode(Mode):
 
     def add_object(self, x: float, y: float, klass: str | None = None) -> dict:
         klass = klass or self.current_class
-        x, y = ui.clamp_field(x, y)
+        x = max(FIELD_PAD, min(FIELD_W - FIELD_PAD, x))
+        y = max(FIELD_PAD, min(FIELD_H - FIELD_PAD, y))
         obj = {
-            "id": f"M{self.next_index:02d}",
+            "id": scenario.next_id(self.objects),
             "klass": klass,
             "x": round(x, 3),
             "y": round(y, 3),
             "priority": max((o["priority"] for o in self.objects), default=0) + 1,
         }
-        self.next_index += 1
         self.objects.append(obj)
         self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
         self.selected = obj
-        self.invalidate_mission()
+        self._touch()
         self._sync_markers()
         return obj
 
@@ -191,37 +226,61 @@ class ManualMode(Mode):
         self.objects = [o for o in self.objects if o is not obj]
         if self.selected is obj:
             self.selected = None
-        self.invalidate_mission()
+        self._touch()
         self._sync_markers()
 
     def clear_map(self) -> None:
-        for marker in self.markers.values():
-            marker.destroy()
-        self.markers.clear()
-        self.objects.clear()
-        self.selected = None
-        self.next_index = 1
-        self.invalidate_mission()
+        self._replace_draft([])
         self.last_exec = ""
-        self._sync_markers()
         self.validate_map_ui()
 
     def load_demo_map(self) -> None:
-        for x, y, k in [
-            (2.1, 0.7, "A"), (3.0, 1.4, "A"), (4.0, 0.7, "A"),
-            (4.2, 2.2, "A"), (1.6, 2.3, "A"), (2.6, 3.2, "A"),
-            (3.6, 2.4, "B"), (3.2, 3.5, "U"), (5.1, 2.1, "A"),
-        ]:
-            self.add_object(x, y, k)
+        """Load the task's base layout as a draft (kept for --map-demo)."""
+        self._replace_draft(scenario.default_objects())
         self.selected = None
-        self._sync_markers()
+        self.last_exec = ""
         self.validate_map_ui()
 
+    def revert_to_applied(self) -> None:
+        self._replace_draft(self.applied)
+        self.selected = None
+        self.last_exec = ""
+        self.validate_map_ui()
+
+    def _replace_draft(self, objects: list[dict]) -> None:
+        for marker in self.markers.values():
+            marker.destroy()
+        self.markers.clear()
+        self.objects = scenario.copy_objects(objects)
+        for obj in self.objects:
+            self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
+        self.selected = None
+        self._touch()
+
+    def _same_as_applied(self) -> bool:
+        def key(obj):
+            return (str(obj["id"]), str(obj["klass"]), round(float(obj["x"]), 3),
+                    round(float(obj["y"]), 3), int(obj.get("priority", 0)))
+        return sorted(map(key, self.objects)) == sorted(map(key, self.applied))
+
+    def _touch(self) -> None:
+        self.dirty = not self._same_as_applied()
+        self.layout_errors = []
+        self.invalidate_mission()
+        self._preview()
+
+    def _rebuild_markers(self) -> None:
+        for marker in self.markers.values():
+            marker.destroy()
+        self.markers.clear()
+        for obj in self.objects:
+            self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
+
     def _sync_markers(self) -> None:
-        for oid, marker in self.markers.items():
+        for marker in self.markers.values():
             marker.sync(self.selected is marker.obj)
 
-    def nearest(self, point: tuple[float, float], radius: float = 0.22) -> dict | None:
+    def nearest(self, point: tuple[float, float], radius: float = 0.24) -> dict | None:
         best, best_d = None, radius
         for obj in self.objects:
             d = math.hypot(obj["x"] - point[0], obj["y"] - point[1])
@@ -238,7 +297,7 @@ class ManualMode(Mode):
 
         if mouse.left and not self._was_left:
             if self._hover_point is not None:
-                hit = self.nearest(self._hover_point, 0.24)
+                hit = self.nearest(self._hover_point, 0.26)
                 if hit is not None:
                     self.selected = hit
                     self.drag = hit
@@ -247,16 +306,20 @@ class ManualMode(Mode):
                 self._sync_markers()
                 self.validate_map_ui()
         elif mouse.left and self.drag is not None and self._hover_point is not None:
-            self.drag["x"] = round(self._hover_point[0], 3)
-            self.drag["y"] = round(self._hover_point[1], 3)
+            self.drag["x"] = round(max(FIELD_PAD, min(FIELD_W - FIELD_PAD,
+                                                    self._hover_point[0])), 3)
+            self.drag["y"] = round(max(FIELD_PAD, min(FIELD_H - FIELD_PAD,
+                                                    self._hover_point[1])), 3)
             self._sync_markers()
             self.validate_map_ui()
 
         if not mouse.left and self._was_left:
+            if self.drag is not None:
+                self._preview()
             self.drag = None
 
         if mouse.right and not self._was_right and self._hover_point is not None:
-            hit = self.nearest(self._hover_point, 0.24)
+            hit = self.nearest(self._hover_point, 0.26)
             if hit is not None:
                 self.remove_object(hit)
                 self.validate_map_ui()
@@ -269,8 +332,6 @@ class ManualMode(Mode):
             self.set_class({"1": "A", "2": "B", "3": "U"}[key])
         elif key == "delete":
             self.delete_selected()
-        elif key == "enter":
-            self.generate_mission()
         elif key == "v":
             self.validate_map_ui()
         elif key == "escape":
@@ -279,6 +340,34 @@ class ManualMode(Mode):
             self._sync_markers()
 
     # ------------------------------------------------------------------ #
+    def _field_busy(self) -> str | None:
+        work = self.app.modes.get("work")
+        if self.app.execution is not None:
+            return "идёт полёт: менять поле нельзя"
+        if work is not None and work.phase in {"recon", "cv"}:
+            return "идёт разведка: менять поле нельзя"
+        return None
+
+    def apply_to_field(self) -> None:
+        busy = self._field_busy()
+        if busy:
+            self.layout_errors = [busy]
+            self.validate_map_ui()
+            return
+        errors = self.app.apply_layout(self.objects)
+        if errors:
+            self.layout_errors = errors
+            self.last_exec = ""
+            self.validate_map_ui()
+            return
+        self.applied = scenario.copy_objects(self.objects)
+        self.dirty = False
+        self.layout_errors = []
+        self.last_exec = ("поле обновлено: режим 3 полетит по этой карте"
+                          if not scenario.is_default(self.objects)
+                          else "восстановлена базовая раскладка")
+        self.validate_map_ui()
+
     def _evaluate(self) -> tuple[list[dict], list[dict]]:
         zones = [Polygon("NFZ-1", tuple(Point(x, y) for x, y in NO_FLY))]
         accepted, rows = [], []
@@ -313,11 +402,20 @@ class ManualMode(Mode):
                       f"x={o['x']:.3f}  y={o['y']:.3f}  P={o['priority']}", ""]
         else:
             lines += ["объект не выбран", ""]
+        layout_errors = scenario.validate(self.objects) if self.objects else ["карта пуста"]
+        self.layout_errors = layout_errors
+        if layout_errors:
+            lines.append("ПОЛИГОН: нельзя применить")
+            lines += [f"· {err}" for err in layout_errors[:4]]
+            lines.append("")
+        else:
+            lines.append("ПОЛИГОН: проверка пройдена")
+            lines.append("")
         for row in rows:
-            if row["reasons"]:
+            if row["reasons"] and not layout_errors:
                 lines.append(f"{row['id']} {row['klass']} — {', '.join(row['reasons'])}")
         if self.mission_path:
-            lines += ["", "МИССИЯ СГЕНЕРИРОВАНА",
+            lines += ["", "УЧЕБНАЯ МИССИЯ",
                       f"целей: {len(self.mission.get('targets', [])) if self.mission else 0}",
                       f"файл: {Path(self.mission_path).name}",
                       "статус: " + ("ГОТОВА" if self.mission_valid else "НЕ ГОТОВА")]
@@ -326,13 +424,19 @@ class ManualMode(Mode):
         wrapped: list[str] = []
         for line in lines:
             wrapped.extend(textwrap.wrap(line, 54) or [""])
-        self.check_text.text = "\n".join(wrapped[:32])
+        self.check_text.text = "\n".join(wrapped[:34])
+        applied_state = "применено" if not self.dirty else "есть правки"
+        extra = self.layout_errors[0] if self.layout_errors else ""
         self.status.text = (
             f"класс: {CLASS_NAMES[self.current_class]}\n"
-            f"объектов: {len(self.objects)}   допустимых A: {len(accepted)}\n"
-            f"миссия: {'готова' if self.mission_valid else 'не готова'}"
+            f"поле: {applied_state} · объектов: {len(self.objects)}\n"
+            f"допустимых A: {len(accepted)}"
+            + (f"\n{extra[:46]}" if extra else "")
         )
         ui.set_button(self.launch_btn, bool(self.mission_path and self.mission_valid))
+        apply_ready = (not self.layout_errors and self.dirty
+                       and self._field_busy() is None)
+        ui.set_button(self.apply_btn, apply_ready, tint=ui.BUTTON_ACTIVE)
 
     def invalidate_mission(self) -> None:
         if self.mission_path is not None:
@@ -356,7 +460,7 @@ class ManualMode(Mode):
         order.insert(target, order.pop(index))
         for i, obj in enumerate(order, 1):
             obj["priority"] = i
-        self.invalidate_mission()
+        self._touch()
         self.validate_map_ui()
 
     # ------------------------------------------------------------------ #

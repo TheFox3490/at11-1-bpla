@@ -5,3 +5,6 @@ spike/out/
 runs/
 missions/
 state/
+data/layout.json
+data/textures/class_*.png
+data/textures/route_*.png

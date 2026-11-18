@@ -36,10 +36,12 @@ def scan_path_f() -> list[tuple[float, float]]:
 
 class ReconRun:
     def __init__(self, drone: Drone, grabber: FrameGrabber, run_dir: str | Path,
-                 frame: LocalFrame | None = None):
+                 frame: LocalFrame | None = None,
+                 set_calibration=None):
         self.drone = drone
         self.grabber = grabber
         self.frame = frame or LocalFrame.from_spec("L_recon")
+        self.set_calibration = set_calibration or (lambda on: None)
         self.run_dir = Path(run_dir)
         self.frames_dir = self.run_dir / "frames"
         self.frames_dir.mkdir(parents=True, exist_ok=True)
@@ -63,6 +65,7 @@ class ReconRun:
         self.frame_ids: list[str] = []
         self.capture_count = 0
         self.expected_captures = 1 + len(self.path_l)
+        self.set_calibration(False)
 
         self.drone.reset()
         self.drone.speed_limit = SPEED_LIMIT
@@ -135,6 +138,7 @@ class ReconRun:
         self._waiting_capture = False
 
         if frame_id == "calib":
+            self.set_calibration(False)
             self.index = 0
             self.phase = "to_waypoint"
             self._goto_waypoint()
@@ -150,6 +154,7 @@ class ReconRun:
                             ALT_NOMINAL)
 
     def _fail(self, message: str) -> None:
+        self.set_calibration(False)
         self.error = message
         self.phase = "failed"
         self.done = True
@@ -207,6 +212,7 @@ class ReconRun:
                 if self._settle >= 0.15:
                     self._settle = 0.0
                     if self.phase == "to_calib":
+                        self.set_calibration(True)
                         self.phase = "capture_calib"
                         self._arm("calib")
                     else:
@@ -233,6 +239,7 @@ class ReconRun:
 
     def cancel(self) -> None:
         self.grabber.cancel()
+        self.set_calibration(False)
         self.done = True
         self.error = self.error or "отменено пользователем"
         self.phase = "failed"

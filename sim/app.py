@@ -18,7 +18,8 @@ from ursina import (  # noqa: E402
 
 from shared.contracts import new_id  # noqa: E402
 from shared.frames import LocalFrame  # noqa: E402
-from sim import ui  # noqa: E402
+from shared.world import EXEC_LIMIT_SECONDS  # noqa: E402
+from sim import scenario, ui  # noqa: E402
 from sim.capture import FrameGrabber  # noqa: E402
 from sim.drone import Drone  # noqa: E402
 from sim.executor import ExecutorRun  # noqa: E402
@@ -44,8 +45,9 @@ class Application:
         )
         window.color = color.rgb32(128, 176, 222)
         Sky()
-        self.scene = WorldScene()
-        self.grabber = FrameGrabber(self.scene.capture_hidden_entities())
+        self.layout = scenario.load_layout()
+        self.scene = WorldScene(layout=self.layout)
+        self.grabber = FrameGrabber(self.scene.capture_hidden_entities)
         self.drone = Drone(self.scene.rig)
         self.speed = 1.0
         self.mode = None
@@ -70,8 +72,8 @@ class Application:
         self.add_top = ui.panel(position=(0.0, 0.455), scale=(1.72, 0.06),
                                 tint=color.rgba32(8, 12, 20, 235), name="mode_bar")
         labels = [("free", "1 · СВОБОДНЫЙ ПОЛЁТ"),
-                  ("manual", "2 · РУЧНАЯ КАРТА"),
-                  ("work", "3 · РАЗВЕДКА")]
+                  ("manual", "2 · КОНСТРУКТОР ПОЛЯ"),
+                  ("work", "3 · РАЗВЕДКА → МИССИЯ")]
         self.mode_buttons = {}
         for i, (name, text) in enumerate(labels):
             button = ui.button(None, text, (-0.70 + i * 0.35, 0.455),
@@ -113,6 +115,24 @@ class Application:
         if reset_led:
             self.scene.rig.set_led(False)
         self.scene.sync_visuals(self.drone.alt)
+
+    def apply_layout(self, objects: list[dict], persist: bool = True) -> list[str]:
+        """Make an edited layout the physical field; returns validation errors.
+
+        ``persist=False`` is used by the selftest so a diagnostic run never
+        overwrites the layout the operator saved.
+        """
+        errors = scenario.validate(objects)
+        if errors:
+            return errors
+        self.scene.set_layout(objects)
+        if persist:
+            scenario.save_layout(objects)
+        self.layout = scenario.copy_objects(objects)
+        work = getattr(self, "modes", {}).get("work")
+        if work is not None:
+            work.on_layout_applied()
+        return []
 
     # ------------------------------------------------------------------ #
     def start_executor(self, mission_path: str, source=None,
@@ -223,6 +243,7 @@ def input(key: str) -> None:  # noqa: A001 - name required by Ursina
 def run_selftest(app: Application) -> None:
     failures: list[str] = []
     step = app.ursina.step
+    saved_layout = scenario.copy_objects(app.layout)
 
     def check(name: str, condition: bool, detail: str = "") -> None:
         print(f"  {'PASS' if condition else 'FAIL'}  {name} {detail}")
@@ -248,96 +269,171 @@ def run_selftest(app: Application) -> None:
     app.set_mode("manual")
     check("manual mode camera is top-down", abs(camera.rotation_x - 90) < 1e-6)
 
-    print("2) ручная карта и миссия")
-    manual = app.modes["manual"]
-    manual.clear_map()
-    manual.set_class("A")
-    for x, y in [(2.1, 0.7), (3.0, 1.4), (4.0, 0.7),
-                 (4.2, 2.2), (1.6, 2.3), (2.6, 3.2)]:
-        manual.add_object(x, y, "A")
-    manual.add_object(5.1, 2.1, "A")   # inside NFZ -> rejected
-    manual.add_object(3.6, 2.4, "B")
-    manual.add_object(3.2, 3.5, "U")
-    manual.generate_mission()
-    check("manual mission valid", manual.mission_valid,
-          f"errors={manual.mission_errors}")
-    check("manual mission has 6 A targets",
-          bool(manual.mission) and len(manual.mission.get("targets", [])) == 6)
-    check("manual map rejects 3 objects",
-          bool(manual.mission) and len(manual.mission.get("rejected", [])) == 3)
-    if manual.mission:
-        from cv.validator import validate_mission
-        check("manual mission checksum", not validate_mission(manual.mission))
+    try:
+        print("2) конструктор поля: проверка и применение")
+        work = app.modes["work"]
+        custom = [
+            {"id": "P01", "klass": "A", "x": 1.0, "y": 0.8, "priority": 1},
+            {"id": "P02", "klass": "A", "x": 1.8, "y": 0.8, "priority": 2},
+            {"id": "P03", "klass": "A", "x": 2.6, "y": 0.8, "priority": 3},
+            {"id": "P04", "klass": "B", "x": 1.0, "y": 1.6, "priority": 4},
+        ]
+        errors = app.apply_layout(custom, persist=False)
+        check("custom field applies", not errors, f"errors={errors}")
+        check("scene rebuilt from the layout",
+              set(app.scene.plot_entities) == {o["id"] for o in custom})
+        check("layout change drops the previous mission",
+              work.phase == "idle" and work.mission is None)
+        bad = [{"id": "P01", "klass": "A", "x": 0.02, "y": 0.02, "priority": 1}]
+        check("validation rejects a plot outside the margins",
+              bool(app.apply_layout(bad, persist=False)))
+        check("rejected layout is not applied",
+              set(app.scene.plot_entities) == {o["id"] for o in custom})
+        check("default field restored for recon",
+              not app.apply_layout(scenario.default_objects(), persist=False))
 
-    print("3) режим 3: разведка -> CV -> исполнитель")
-    app.set_mode("work")
-    work = app.modes["work"]
-    work.reset_work()
-    registry = ROOT / "state" / "selftest_registry.json"
-    registry.parent.mkdir(parents=True, exist_ok=True)
-    registry.unlink(missing_ok=True)
-    app.registry_path = registry
-    app.set_speed(5.0)
-    work.start_recon()
-    deadline = time.time() + 240.0
-    last_note = 0
-    while time.time() < deadline:
-        step()
-        if work.phase in {"ready", "mission_invalid", "cv_failed", "recon_failed"}:
-            break
-        if work.recon is not None and work.recon.capture_count >= last_note + 5:
-            last_note = work.recon.capture_count
-            print(f"    кадров {work.recon.capture_count}/"
-                  f"{work.recon.expected_captures}, t={work.recon.t:.1f}s")
-    check("recon completed", work.recon is not None and work.recon.done and not work.recon.error,
-          work.recon.error if work.recon else "no recon")
-    check("CV produced a valid mission", work.phase == "ready" and work.mission_valid,
-          f"phase={work.phase} err={work.cv_error or ''}")
-    if work.result is not None:
-        counts = work.result.report.get("counts", {})
-        print(f"    объектов {counts.get('objects')}, A={counts.get('A')}, "
-              f"B={counts.get('B')}, U={counts.get('U')}, "
-              f"целей {counts.get('mission_targets')}, отклонено {counts.get('rejected')}")
-        check("10 objects detected", counts.get("objects") == 10,
-              f"got {counts.get('objects')}")
-        check("mission has 6 targets", counts.get("mission_targets") == 6,
-              f"got {counts.get('mission_targets')}")
-        check("all 4 forbidden/other objects rejected",
-              counts.get("rejected") == 4, f"got {counts.get('rejected')}")
-    if work.mission_valid:
-        work.start_executor()
-        deadline = time.time() + 180.0
-        while time.time() < deadline:
-            step()
-            if app.execution is None and work.phase in {"exec_done", "exec_failed"}:
-                break
-        run = app.last_execution
-        check("executor finished", run is not None and run.done and not run.failed,
-              run.error if run else "no execution")
-        if run is not None:
-            confirmed = sum(1 for a in run.actions if a.get("status") == "confirmed")
-            check("all targets actioned once", confirmed == len(run.plan.get("targets", [])),
-                  f"{confirmed}/{len(run.plan.get('targets', []))}")
-            check("drone landed", run.drone.alt <= 0.07,
-                  f"alt={run.drone.alt:.3f}")
+        print("3) ручная карта и миссия")
+        manual = app.modes["manual"]
+        manual.clear_map()
+        manual.set_class("A")
+        for x, y in [(2.1, 0.7), (3.0, 1.4), (4.0, 0.7),
+                     (4.2, 2.2), (1.6, 2.3), (2.6, 3.2)]:
+            manual.add_object(x, y, "A")
+        manual.add_object(5.1, 2.1, "A")   # inside NFZ -> rejected
+        manual.add_object(3.6, 2.4, "B")
+        manual.add_object(3.2, 3.5, "U")
+        manual.generate_mission()
+        check("manual mission valid", manual.mission_valid,
+              f"errors={manual.mission_errors}")
+        check("manual mission has 6 A targets",
+              bool(manual.mission) and len(manual.mission.get("targets", [])) == 6)
+        check("manual map rejects 3 objects",
+              bool(manual.mission) and len(manual.mission.get("rejected", [])) == 3)
+        if manual.mission:
+            from cv.validator import validate_mission
+            check("manual mission checksum", not validate_mission(manual.mission))
 
-        print("4) реестр действий: повторный запуск")
-        work.start_executor()
-        deadline = time.time() + 180.0
+        print("4) режим 3: разведка -> CV -> исполнитель")
+        app.set_mode("work")
+        work.reset_work()
+        registry = ROOT / "state" / "selftest_registry.json"
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.unlink(missing_ok=True)
+        app.registry_path = registry
+        app.set_speed(5.0)
+        check("calibration markers hidden before recon",
+              not any(e.visible for e in app.scene.calib_entities))
+        work.start_recon()
+        deadline = time.time() + 240.0
+        last_note = 0
+        calib_seen_visible = False
+        calib_visible_wrongly = False
         while time.time() < deadline:
+            if work.recon is not None:
+                visible = any(e.visible for e in app.scene.calib_entities)
+                if work.recon.phase == "capture_calib":
+                    calib_seen_visible = calib_seen_visible or visible
+                elif visible:
+                    calib_visible_wrongly = True
             step()
-            if app.execution is None and work.phase in {"exec_done", "exec_failed"}:
+            if work.phase in {"ready", "mission_invalid", "cv_failed", "recon_failed"}:
                 break
-        run2 = app.last_execution
-        check("second run finished", run2 is not None and run2.done and not run2.failed,
-              run2.error if run2 else "no execution")
-        if run2 is not None:
-            total2 = len(run2.plan.get("targets", [])) if run2.plan else 0
-            confirmed2 = sum(1 for a in run2.actions if a.get("status") == "confirmed")
-            blocked2 = sum(1 for a in run2.actions if a.get("status") == "blocked")
-            check("registry blocks repeated actions",
-                  confirmed2 == 0 and blocked2 == total2,
-                  f"confirmed={confirmed2} blocked={blocked2}/{total2}")
+            if work.recon is not None and work.recon.capture_count >= last_note + 5:
+                last_note = work.recon.capture_count
+                print(f"    кадров {work.recon.capture_count}/"
+                      f"{work.recon.expected_captures}, t={work.recon.t:.1f}s")
+        check("recon completed", work.recon is not None and work.recon.done and not work.recon.error,
+              work.recon.error if work.recon else "no recon")
+        check("calibration markers shown only for the calibration frame",
+              calib_seen_visible and not calib_visible_wrongly)
+        check("calibration markers hidden after recon",
+              not any(e.visible for e in app.scene.calib_entities))
+        check("CV produced a valid mission", work.phase == "ready" and work.mission_valid,
+              f"phase={work.phase} err={work.cv_error or ''}")
+        if work.result is not None:
+            counts = work.result.report.get("counts", {})
+            print(f"    объектов {counts.get('objects')}, A={counts.get('A')}, "
+                  f"B={counts.get('B')}, U={counts.get('U')}, "
+                  f"целей {counts.get('mission_targets')}, отклонено {counts.get('rejected')}")
+            check("10 objects detected", counts.get("objects") == 10,
+                  f"got {counts.get('objects')}")
+            check("mission has 6 targets", counts.get("mission_targets") == 6,
+                  f"got {counts.get('mission_targets')}")
+            check("all 4 forbidden/other objects rejected",
+                  counts.get("rejected") == 4, f"got {counts.get('rejected')}")
+        if work.plan:
+            comparison = work.plan.get("comparison") or []
+            methods = [m.get("method") for m in comparison]
+            check("planner compared two order methods", len(methods) >= 2,
+                  f"{methods}")
+            feasible = [m for m in comparison if m.get("feasible")]
+            shortest = min(feasible, key=lambda m: m.get("length_m", 1e9)) if feasible else None
+            check("chosen order is the shortest feasible one",
+                  shortest is not None and work.plan.get("method") == shortest["method"],
+                  f"chosen={work.plan.get('method')}")
+            check("route preview is displayed",
+                  bool(app.scene.route_entities) and work.route_title.text == "МАРШРУТ ПОСТРОЕН",
+                  f"entities={len(app.scene.route_entities)}")
+        else:
+            check("planner produced a route", False, "no plan")
+
+        print("5) бюджет времени: подмножество и причины пропуска")
+        work.set_budget(60.0)
+        skipped = (work.plan or {}).get("skipped") or []
+        check("60 s budget selects a subset", bool(skipped), f"{skipped}")
+        check("skipped targets carry a reason",
+              all(s.get("reason") for s in skipped))
+        check("mission file is marked partial",
+              bool(work.mission) and work.mission.get("partial") is True)
+        if skipped and work.mission:
+            dropped = {s["target_id"] for s in skipped}
+            present = {t["target_id"] for t in work.mission["targets"]}
+            check("subset mission drops exactly the skipped targets",
+                  not (dropped & present), f"{sorted(dropped)}")
+            check("subset still fits the budget",
+                  work.plan.get("total_with_reserve_s", 1e9) <= 60.0,
+                  f"{work.plan.get('total_with_reserve_s')} s")
+        work.set_budget(EXEC_LIMIT_SECONDS)
+        check("full budget restores all 6 targets",
+              bool(work.mission) and len(work.mission.get("targets", [])) == 6)
+
+        if work.mission_valid:
+            work.start_executor()
+            deadline = time.time() + 180.0
+            while time.time() < deadline:
+                step()
+                if app.execution is None and work.phase in {"exec_done", "exec_failed"}:
+                    break
+            run = app.last_execution
+            check("executor finished", run is not None and run.done and not run.failed,
+                  run.error if run else "no execution")
+            if run is not None:
+                confirmed = sum(1 for a in run.actions if a.get("status") == "confirmed")
+                check("all targets actioned once", confirmed == len(run.plan.get("targets", [])),
+                      f"{confirmed}/{len(run.plan.get('targets', []))}")
+                check("drone landed", run.drone.alt <= 0.07,
+                      f"alt={run.drone.alt:.3f}")
+
+            print("6) реестр действий: повторный запуск")
+            work.start_executor()
+            deadline = time.time() + 180.0
+            while time.time() < deadline:
+                step()
+                if app.execution is None and work.phase in {"exec_done", "exec_failed"}:
+                    break
+            run2 = app.last_execution
+            check("second run finished", run2 is not None and run2.done and not run2.failed,
+                  run2.error if run2 else "no execution")
+            if run2 is not None:
+                total2 = len(run2.plan.get("targets", [])) if run2.plan else 0
+                confirmed2 = sum(1 for a in run2.actions if a.get("status") == "confirmed")
+                blocked2 = sum(1 for a in run2.actions if a.get("status") == "blocked")
+                check("registry blocks repeated actions",
+                      confirmed2 == 0 and blocked2 == total2,
+                      f"confirmed={confirmed2} blocked={blocked2}/{total2}")
+    finally:
+        app.set_mode("manual")
+        app.apply_layout(saved_layout, persist=False)
 
     print("\nselftest:", "OK" if not failures else f"FAILED {failures}")
 

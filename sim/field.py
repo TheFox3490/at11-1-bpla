@@ -131,6 +131,36 @@ def plot_texture_paths(tex_dir: Path | None = None) -> dict[str, Path]:
     }
 
 
+def class_texture_paths(tex_dir: Path | None = None) -> dict[str, Path]:
+    """One texture per class, reused by every plot of an editable layout."""
+    tex_dir = tex_dir or textures_dir()
+    return {
+        cls: make_plot_texture(cls, tex_dir / f"class_{cls}.png")
+        for cls in ("A", "B", "U")
+    }
+
+
+def route_number_texture(number: int, tex_dir: Path | None = None) -> Path:
+    """Round badge with the visit order, drawn once per number."""
+    tex_dir = tex_dir or textures_dir()
+    path = tex_dir / f"route_{number:02d}.png"
+    if path.exists():
+        return path
+    s = 128
+    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse([4, 4, s - 4, s - 4], fill=(10, 20, 34, 232),
+              outline=(80, 230, 255, 255), width=7)
+    try:
+        font = ImageFont.truetype("arialbd.ttf", 72)
+    except OSError:
+        font = ImageFont.load_default()
+    d.text((s / 2, s / 2 - 3), str(number), font=font,
+           fill=(255, 255, 255, 255), anchor="mm")
+    img.save(path)
+    return path
+
+
 @dataclass
 class Pose:
     x: float
