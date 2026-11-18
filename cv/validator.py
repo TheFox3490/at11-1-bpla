@@ -104,7 +104,8 @@ def validate_target(t: Target, forbidden: Iterable[Polygon]) -> list[str]:
     return errors
 
 
-def validate_map_header(data: dict, now: datetime | None = None) -> list[str]:
+def validate_map_header(data: dict, now: datetime | None = None,
+                        known_calibrations: set[str] | None = None) -> list[str]:
     errors = []
     if data.get("coordinate_frame") != "F":
         errors.append("wrong_or_missing_coordinate_frame")
@@ -114,6 +115,10 @@ def validate_map_header(data: dict, now: datetime | None = None) -> list[str]:
         errors.append("missing_mission_id")
     if not data.get("calibration_version"):
         errors.append("missing_calibration_version")
+    elif known_calibrations is not None:
+        version = str(data["calibration_version"])
+        if version not in known_calibrations and not version.startswith("manual_"):
+            errors.append("unknown_calibration_version")
     if not data.get("checksum"):
         errors.append("missing_checksum")
     try:
@@ -164,8 +169,9 @@ def _zone_from_dict(item: dict) -> Polygon:
 
 
 def validate_mission(data: dict, now: datetime | None = None,
-                     check_checksum: bool = True) -> list[str]:
-    errors = validate_map_header(data, now)
+                     check_checksum: bool = True,
+                     known_calibrations: set[str] | None = None) -> list[str]:
+    errors = validate_map_header(data, now, known_calibrations=known_calibrations)
     if check_checksum and not verify_checksum(data):
         errors.append("checksum_mismatch")
     zones = []
@@ -197,7 +203,8 @@ def operation_gate(*, map_valid: bool, class_a: bool, position_fresh: bool,
                    position_error_m: float, already_actioned: bool,
                    distance_to_target_m: float | None = None,
                    target_in_forbidden: bool = False,
-                   drone_in_forbidden: bool = False) -> tuple[bool, str]:
+                   drone_in_forbidden: bool = False,
+                   link_ok: bool = True) -> tuple[bool, str]:
     """Pure safety decision; does not actuate hardware."""
     if not map_valid:
         return False, "invalid_map"
@@ -205,6 +212,8 @@ def operation_gate(*, map_valid: bool, class_a: bool, position_fresh: bool,
         return False, "forbidden_zone"
     if not class_a:
         return False, "target_not_A"
+    if not link_ok:
+        return False, "control_link_lost"
     if not position_fresh:
         return False, "stale_localization"
     if not (1.0 <= altitude_m <= 1.4):

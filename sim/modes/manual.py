@@ -247,6 +247,21 @@ class ManualMode(Mode):
         self.last_exec = ""
         self.validate_map_ui()
 
+    def sync_applied(self, objects: list[dict]) -> None:
+        """The field changed elsewhere: keep the applied baseline honest."""
+        self.applied = scenario.copy_objects(objects)
+        if not self.dirty:
+            for marker in self.markers.values():
+                marker.destroy()
+            self.markers.clear()
+            self.objects = scenario.copy_objects(objects)
+            for obj in self.objects:
+                self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
+            self.selected = None
+            self._preview()
+            self._sync_markers()
+        self.validate_map_ui()
+
     def _replace_draft(self, objects: list[dict]) -> None:
         for marker in self.markers.values():
             marker.destroy()

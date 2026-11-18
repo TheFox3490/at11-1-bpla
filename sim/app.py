@@ -27,6 +27,7 @@ from sim.modes.free import FreeMode  # noqa: E402
 from sim.modes.manual import ManualMode  # noqa: E402
 from sim.modes.work import WorkMode  # noqa: E402
 from sim.scene import WorldScene  # noqa: E402
+from tests.bench import BenchOverlay, run_cli  # noqa: E402
 
 RUNS_DIR = ROOT / "runs"
 APP = None
@@ -64,6 +65,7 @@ class Application:
             "manual": ManualMode(self),
             "work": WorkMode(self),
         }
+        self.bench = BenchOverlay(self)
         self.set_speed(1.0)
         self.set_mode("free")
 
@@ -96,11 +98,16 @@ class Application:
             return
         if name not in self.modes:
             return
+        bench = getattr(self, "bench", None)
+        if bench is not None and bench.running and name != self.mode_name:
+            return
         if self.mode is not None:
             self.mode.exit()
         self.mode_name = name
         self.mode = self.modes[name]
         self.mode.enter()
+        if bench is not None and bench.visible:
+            self.mode.set_ui_visible(False)
         for key, button in self.mode_buttons.items():
             ui.highlight_button(button, key == name)
 
@@ -132,15 +139,20 @@ class Application:
         work = getattr(self, "modes", {}).get("work")
         if work is not None:
             work.on_layout_applied()
+        manual = getattr(self, "modes", {}).get("manual")
+        if manual is not None:
+            manual.sync_applied(self.layout)
         return []
 
     # ------------------------------------------------------------------ #
     def start_executor(self, mission_path: str, source=None,
-                       registry_path: str | Path | None = None) -> ExecutorRun:
+                       registry_path: str | Path | None = None,
+                       faults: dict | None = None) -> ExecutorRun:
         run_dir = RUNS_DIR / new_id("exec")
         run = ExecutorRun(self.drone, mission_path, run_dir,
                           frame=LocalFrame.from_spec("L_exec"),
-                          registry_path=registry_path or self.registry_path)
+                          registry_path=registry_path or self.registry_path,
+                          faults=faults)
         self.execution = run
         self.execution_source = source
         if run.done:
@@ -197,11 +209,19 @@ class Application:
         if self.execution is not None and self.execution.done:
             self._finish_execution()
 
+        self.bench.update()
         self.scene.sync_visuals(self.drone.alt)
         if self.mode is not None:
             self.mode.refresh()
+            if self.bench.visible:
+                # The bench owns the screen: the mode's own panels and the
+                # route banner must not reappear behind it.
+                self.mode.set_ui_visible(False)
 
     def input(self, key: str) -> None:
+        if key == "f9":
+            self.bench.toggle()
+            return
         if key == "f1":
             self.set_mode("free")
             return
@@ -210,6 +230,8 @@ class Application:
             return
         if key == "f3":
             self.set_mode("work")
+            return
+        if self.bench.visible:
             return
         if key == "escape" and self.mode is not None:
             self.mode.input(key)
@@ -291,6 +313,9 @@ def run_selftest(app: Application) -> None:
               set(app.scene.plot_entities) == {o["id"] for o in custom})
         check("default field restored for recon",
               not app.apply_layout(scenario.default_objects(), persist=False))
+        check("recon field has the 10 task plots",
+              len(app.scene.plot_entities) == 10,
+              f"got {len(app.scene.plot_entities)}")
 
         print("3) ручная карта и миссия")
         manual = app.modes["manual"]
@@ -451,11 +476,25 @@ def main() -> None:
     parser.add_argument("--mode", type=str, default="1")
     parser.add_argument("--map-demo", action="store_true",
                         help="with --shot: fill the manual map with a demo layout")
+    parser.add_argument("--tests", action="store_true",
+                        help="run the C1-C8 acceptance scenarios and write a protocol")
+    parser.add_argument("--only", type=str, default=None,
+                        help="with --tests: comma-separated scenario ids, e.g. C3,C6")
+    parser.add_argument("--bench", action="store_true",
+                        help="open the acceptance bench overlay (with --shot)")
     parser.add_argument("--speed", type=float, default=1.0)
     args = parser.parse_args()
 
     APP = Application()
     APP.set_speed(args.speed)
+
+    if args.tests:
+        only = None
+        if args.only:
+            only = [part.strip().upper() for part in args.only.split(",") if part.strip()]
+        code = run_cli(APP, only)
+        base.userExit()
+        sys.exit(code)
 
     if args.selftest:
         run_selftest(APP)
@@ -467,6 +506,8 @@ def main() -> None:
         APP.set_mode(mode)
         if args.map_demo and mode == "manual":
             APP.modes["manual"].load_demo_map()
+        if args.bench:
+            APP.bench.open()
         for _ in range(6):
             APP.ursina.step()
         APP.screenshot(args.shot)

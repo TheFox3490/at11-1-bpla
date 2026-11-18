@@ -38,12 +38,21 @@ def build_mission(observations: list[Observation], run_id: str,
                   calibration_version: str, last_frame_at: datetime,
                   created_at: datetime | None = None,
                   forbidden: list[tuple[float, float]] | None = None,
-                  mission_id: str | None = None) -> tuple[dict, list[dict]]:
-    """Return (mission document, rejected candidates with reasons)."""
+                  mission_id: str | None = None,
+                  recon_error_m: float | None = None) -> tuple[dict, list[dict]]:
+    """Return (mission document, rejected candidates with reasons).
+
+    ``recon_error_m`` is the measured calibration residual (worst independent
+    check point).  Each target's declared error is the conservative sum of that
+    residual and the spread of its own repeated observations, never below the
+    task's 0.07 m bound.  A target whose estimate breaks the accuracy budget is
+    rejected instead of being actioned on a doubtful coordinate (task C7).
+    """
     created_at = created_at or utc_now()
     forbidden = forbidden or NO_FLY
     mission_id = mission_id or new_id("mission")
     zones = [Polygon("NFZ-1", tuple(Point(x, y) for x, y in forbidden))]
+    calibration_residual = max(0.0, float(recon_error_m or 0.0))
 
     candidates = []
     rejected = []
@@ -53,28 +62,32 @@ def build_mission(observations: list[Observation], run_id: str,
                              "x": obs.x, "y": obs.y,
                              "reasons": ["class_not_permitted"]})
             continue
+        error = max(RECON_ERROR, calibration_residual + obs.spread_m)
         # Temporary IDs; final IDs are assigned after filtering.
-        target = Target("pending", "pending", obs.klass, Point(obs.x, obs.y), RECON_ERROR)
+        target = Target("pending", "pending", obs.klass, Point(obs.x, obs.y), error)
         reasons = validate_target(target, zones)
         if reasons:
             rejected.append({"object_id": obs.oid, "class": obs.klass,
-                             "x": obs.x, "y": obs.y, "reasons": reasons})
+                             "x": obs.x, "y": obs.y,
+                             "position_error_m": round(error, 4),
+                             "reasons": reasons})
         else:
-            candidates.append(obs)
+            candidates.append((obs, error))
 
     targets = []
-    for i, obs in enumerate(candidates, 1):
+    for i, (obs, error) in enumerate(candidates, 1):
         target_id = f"T{i:02d}"
         targets.append({
             "target_id": target_id,
             "action_id": f"{mission_id}-{target_id}",
             "klass": obs.klass,
             "point": {"x": round(obs.x, 4), "y": round(obs.y, 4)},
-            "position_error_m": RECON_ERROR,
+            "position_error_m": round(error, 4),
             "priority": i,
             "source_object_id": obs.oid,
             "source_frames": obs.frames,
             "observations": obs.n_obs,
+            "spread_m": round(obs.spread_m, 4),
         })
 
     valid_until = last_frame_at + timedelta(seconds=MAP_TTL_SECONDS)

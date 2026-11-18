@@ -24,6 +24,7 @@ class Observation:
     frames: list[str]
     score: float
     details: dict = field(default_factory=dict)
+    spread_m: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -35,6 +36,7 @@ class Observation:
             "votes": {k: round(v, 4) for k, v in self.votes.items()},
             "frames": self.frames,
             "score": round(self.score, 4),
+            "spread_m": round(self.spread_m, 4),
             "details": self.details,
         }
 
@@ -76,10 +78,12 @@ def merge_detections(detections: list[Detection]) -> list[Observation]:
         strong = {k for k, v in votes.items() if v >= 0.15 * total}
         klass = "U" if len(strong) > 1 else max(votes, key=votes.get)
         frames = sorted({d.frame_id for d in cluster if d.frame_id})
+        spread = max(math.hypot(d.x - cx, d.y - cy) for d in cluster)
         out.append(Observation(oid="", klass=klass, x=cx, y=cy,
                                n_obs=len(cluster), votes=votes,
                                frames=frames, score=total / len(cluster),
-                               details={"max_score": max(d.score for d in cluster)}))
+                               details={"max_score": max(d.score for d in cluster)},
+                               spread_m=spread))
 
     # Stable IDs: bottom-to-top, left-to-right in F.
     out.sort(key=lambda o: (round(o.y, 3), round(o.x, 3)))

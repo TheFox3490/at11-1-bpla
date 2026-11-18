@@ -33,6 +33,7 @@ PHASE_LABEL = {
     "cv_failed": "ошибка CV",
     "exec": "исполнитель",
     "exec_done": "исполнитель завершил",
+    "exec_aborted": "миссия прервана безопасно",
     "exec_failed": "ошибка исполнителя",
     "recon_failed": "ошибка разведки",
 }
@@ -441,6 +442,8 @@ class WorkMode(Mode):
         self.exec_run = run
         if run.failed:
             self.phase = "exec_failed"
+        elif getattr(run, "aborted", False):
+            self.phase = "exec_aborted"
         else:
             self.phase = "exec_done"
         self._refresh_route_view()
@@ -450,7 +453,7 @@ class WorkMode(Mode):
     def _refresh_route_view(self) -> None:
         plan_data = self.plan or {}
         route = plan_data.get("route") or []
-        show = (self.phase in {"ready", "exec", "exec_done"}
+        show = (self.phase in {"ready", "exec", "exec_done", "exec_aborted"}
                 and bool(route) and self.mission_valid)
         if not show:
             self.app.scene.clear_route()
@@ -466,6 +469,8 @@ class WorkMode(Mode):
             title = "МАРШРУТ ВЫПОЛНЯЕТСЯ"
         elif self.phase == "exec_done":
             title = "МАРШРУТ ВЫПОЛНЕН"
+        elif self.phase == "exec_aborted":
+            title = "МИССИЯ ПРЕРВАНА: ВОЗВРАТ"
         else:
             title = "МАРШРУТ ПОСТРОЕН"
         if self.phase == "ready":
@@ -573,10 +578,22 @@ class WorkMode(Mode):
             lines += ["", "ИСПОЛНИТЕЛЬ"]
             confirmed = sum(1 for a in run.actions if a.get("status") == "confirmed")
             blocked = sum(1 for a in run.actions if a.get("status") == "blocked")
+            interrupted = sum(1 for a in run.actions if a.get("status") == "interrupted")
             total = len(run.plan.get("targets", [])) if run.plan else 0
             lines.append(f"подтверждено: {confirmed}/{total}")
             lines.append(f"заблокировано: {blocked}")
+            if interrupted:
+                lines.append(f"прервано операций: {interrupted}")
             lines.append(f"время: {run.t:.1f} с")
+            if getattr(run, "aborted", False):
+                lines += ["", "МИССИЯ ПРЕРВАНА"]
+                lines.append(f"причина: {run.abort_reason}")
+                lines.append("режим: " + ("возврат на базу"
+                                          if run.abort_mode == "home"
+                                          else "аварийная посадка"))
+                lines.append("безопасное завершение: посадка")
+            if getattr(run, "uncertain_actions", None):
+                lines.append(f"UNCERTAIN до проверки: {len(run.uncertain_actions)}")
             if run.error:
                 lines += textwrap.wrap(run.error, 52)[:4]
             lines.append(f"журнал: {run.run_dir.name}/journal.jsonl"[:50])
@@ -622,11 +639,13 @@ class WorkMode(Mode):
             pct = int(round(self.cv_progress.get("fraction", 0.0) * 100))
             status = [f"CV: {pct}%", self.cv_progress.get("stage", ""),
                       "ожидайте завершения"]
-        elif self.phase in {"ready", "exec", "exec_done"}:
+        elif self.phase in {"ready", "exec", "exec_done", "exec_aborted"}:
             status = [f"фаза: {PHASE_LABEL.get(self.phase, self.phase)}",
                       f"миссия: {Path(self.mission_path).name if self.mission_path else '—'}"[:40],
                       f"бюджет: {self.budget_s:.0f} с",
                       "маршрут показан на поле"]
+            if self.phase == "exec_aborted" and self.exec_run is not None:
+                status.insert(1, f"причина: {self.exec_run.abort_reason}")
         elif self.phase in {"mission_invalid", "cv_failed", "recon_failed", "exec_failed"}:
             status = [f"фаза: {PHASE_LABEL.get(self.phase, self.phase)}",
                       self.cv_error or (self.recon.error if self.recon else "") or

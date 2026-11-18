@@ -22,6 +22,13 @@ class CalibrationError(RuntimeError):
     pass
 
 
+# The independent check points tell us how well the flat-field model holds.
+# Above this residual the coordinates are not trustworthy enough for a 0.13 m
+# recon budget, so the run is refused and reconnaissance must be repeated
+# (task C7) instead of acting on a doubtful coordinate.
+MAX_CHECK_ERROR_MM = 30.0
+
+
 def camera_f_px(width: int = IMG_W, hfov_deg: float = HFOV) -> float:
     return (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
 
@@ -147,6 +154,10 @@ def calibrate(frame: np.ndarray, pose_local: dict) -> Calibration:
         homography = None
 
     worst = max(check_errors.values()) if check_errors else float("inf")
+    if worst > MAX_CHECK_ERROR_MM:
+        raise CalibrationError(
+            f"контрольные точки вне допуска: худшая {worst:.1f} мм "
+            f"при пределе {MAX_CHECK_ERROR_MM:.0f} мм; нужна повторная разведка")
     return Calibration(f_px=f_px, transform=transform, homography=homography,
                        check_errors_mm=check_errors, fit_errors_mm=fit_errors,
                        markers=found, check_points=check_pts,

@@ -142,7 +142,8 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
 
     _progress(progress, "построение миссии", 0.88)
     mission, rejected = build_mission(observations, run_id, calib_version,
-                                      last_frame_at=last_capture)
+                                      last_frame_at=last_capture,
+                                      recon_error_m=calibration.worst_check_mm / 1000.0)
     full_mission = mission
     mission_path = mission_dir / f"{mission['mission_id']}.json"
     # Keep the unmodified CV output for re-planning in the UI.
@@ -158,9 +159,8 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
     if mission["targets"]:
         planning = plan(HOME, mission["targets"], forbidden=NO_FLY,
                         max_time=budget_s)
-        if planning.get("skipped"):
-            mission = apply_subset(full_mission, planning, budget_s)
-            write_json(run_dir / "mission_candidate.json", mission)
+        mission = apply_subset(full_mission, planning, budget_s)
+        write_json(run_dir / "mission_candidate.json", mission)
         write_json(run_dir / "plan.json", planning)
     write_json(mission_path, mission)
 
@@ -183,6 +183,7 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
     report = {
         "run_id": run_id,
         "finished_at": iso(),
+        "duration_s": round(time.time() - started, 3),
         "valid": valid,
         "partial": partial,
         "budget_s": round(float(budget_s), 1),

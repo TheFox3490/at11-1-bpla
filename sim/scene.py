@@ -34,6 +34,7 @@ class WorldScene:
         self.calib_entities: list[Entity] = []
         self.route_entities: list[Entity] = []
         self.route_numbers: list[Entity] = []
+        self.test_markers: list[Entity] = []
         self._badge_textures: dict[int, Texture] = {}
 
         # ground and field
@@ -183,6 +184,34 @@ class WorldScene:
         self.route_numbers.clear()
 
     # ------------------------------------------------------------------ #
+    def show_abort_marker(self, x: float, y: float) -> None:
+        """Magenta cross + beacon where the executor stopped acting."""
+        for angle in (45, -45):
+            self.test_markers.append(Entity(
+                model="cube", scale=(0.46, 0.02, 0.07),
+                position=(float(x), 0.055, float(y)), rotation_y=angle,
+                color=color.rgb32(255, 60, 210), name="abort_marker"))
+        self.test_markers.append(Entity(
+            model="cube", scale=(0.035, 0.5, 0.035),
+            position=(float(x), 0.25, float(y)),
+            color=color.rgb32(255, 60, 210), name="abort_beacon"))
+
+    def show_led_point(self, x: float, y: float) -> None:
+        """Ring at a confirmed LED activation point."""
+        import math as _math
+        pts = [Vec3(float(x) + 0.16 * _math.cos(a), 0.04,
+                    float(y) + 0.16 * _math.sin(a))
+               for a in [i * _math.pi / 12 for i in range(25)]]
+        self.test_markers.append(Entity(
+            model=Mesh(vertices=pts, mode="line", thickness=3),
+            color=color.rgb32(255, 214, 90), name="led_point"))
+
+    def clear_test_markers(self) -> None:
+        for entity in self.test_markers:
+            destroy(entity)
+        self.test_markers.clear()
+
+    # ------------------------------------------------------------------ #
     def sync_visuals(self, alt: float) -> None:
         pos = self.rig.root.position
         self.plumb.scale = (0.02, max(alt, 0.02), 0.02)
@@ -210,7 +239,8 @@ class WorldScene:
         self.trail.visible = on
 
     def capture_hidden_entities(self) -> list[Entity]:
-        out = [self.plumb, self.spot, self.trail, self.calib_zone, *self.route_entities]
+        out = [self.plumb, self.spot, self.trail, self.calib_zone,
+               *self.route_entities, *self.test_markers]
         for group in (self.grid, self.axes, self.nfz):
             out.extend(group)
         return out
