@@ -7,10 +7,10 @@ from shared.world import (
     ALT_NOMINAL, CALIB_MARKERS, CHECK_MARKERS, FIELD_H, FIELD_W, MARKER_SIZE,
     NO_FLY, PLOT_SIZE,
 )
-from sim.drone import DroneRig
+from sim.drone import DroneRig, ROLE_COLORS
 from sim.field import class_texture_paths, route_number_texture
 from sim.layout import validate_consistency
-from sim.scenario import default_objects
+from sim.scenario import CALIBRATION_BOUNDS, default_objects
 
 
 def _xy(point) -> tuple[float, float]:
@@ -32,6 +32,7 @@ class WorldScene:
         self.nfz: list[Entity] = []
         self.border: list[Entity] = []
         self.calib_entities: list[Entity] = []
+        self.start_markers: dict[str, Entity] = {}
         self.route_entities: list[Entity] = []
         self.route_numbers: list[Entity] = []
         self.test_markers: list[Entity] = []
@@ -82,12 +83,20 @@ class WorldScene:
 
         # Editor-only hint: the ground area reserved for the calibration pattern.
         # The individual markers stay hidden outside frames/calib.png.
-        zone = [Vec3(0.34, 0.007, 0.34), Vec3(1.26, 0.007, 0.34),
-                Vec3(1.26, 0.007, 1.26), Vec3(0.34, 0.007, 1.26),
-                Vec3(0.34, 0.007, 0.34)]
+        low, high = CALIBRATION_BOUNDS
+        zone = [Vec3(low, 0.007, low), Vec3(high, 0.007, low),
+                Vec3(high, 0.007, high), Vec3(low, 0.007, high),
+                Vec3(low, 0.007, low)]
         self.calib_zone = Entity(
             model=Mesh(vertices=zone, mode="line", thickness=2),
             color=color.rgba32(90, 170, 255, 170), name="calib_zone", visible=False)
+
+        for role, size, height in (("recon", 0.36, 0.013), ("executor", 0.25, 0.015)):
+            self.start_markers[role] = Entity(
+                model="circle", rotation_x=90, double_sided=True, scale=size,
+                y=height, color=color.rgb32(*ROLE_COLORS[role]),
+                name=f"start_{role}", visible=False,
+            )
 
         # no-fly zone
         zone_verts = [Vec3(x, 0.008, y) for x, y in NO_FLY]
@@ -140,6 +149,15 @@ class WorldScene:
 
     def set_calibration_zone_visible(self, on: bool) -> None:
         self.calib_zone.visible = on
+
+    def show_starts(self, starts: dict[str, tuple[float, float]]) -> None:
+        for role, marker in self.start_markers.items():
+            marker.x, marker.z = starts[role]
+            marker.visible = True
+
+    def hide_starts(self) -> None:
+        for marker in self.start_markers.values():
+            marker.visible = False
 
     # ------------------------------------------------------------------ #
     def show_route(self, route: list, targets: list[dict],
@@ -239,7 +257,7 @@ class WorldScene:
         self.trail.visible = on
 
     def capture_hidden_entities(self) -> list[Entity]:
-        out = [self.plumb, self.spot, self.trail, self.calib_zone,
+        out = [self.plumb, self.spot, self.trail, self.calib_zone, *self.start_markers.values(),
                *self.route_entities, *self.test_markers]
         for group in (self.grid, self.axes, self.nfz):
             out.extend(group)

@@ -21,9 +21,8 @@ from cv.mission import apply_subset, build_mission
 from cv.planner import plan
 from cv.validator import validate_mission
 from shared.contracts import checksum_of, iso, new_id, utc_now, write_json
-from shared.frames import LocalFrame
 from shared.world import (
-    HOME, LOCAL_FRAMES, NO_FLY, expand_polygon, segment_intersects_polygon,
+    HOME, NO_FLY, expand_polygon, segment_intersects_polygon,
 )
 from sim.executor import ExecutorRun
 
@@ -120,11 +119,13 @@ class BenchContext:
         # put the operator's field back afterwards.
         from sim import scenario
         self.saved_layout = scenario.copy_objects(self.app.layout)
-        self.app.apply_layout(scenario.default_objects(), persist=False)
+        self.saved_starts = dict(self.app.starts)
+        self.app.apply_layout(scenario.default_objects(), persist=False,
+                              starts=scenario.default_starts())
 
     def close(self) -> None:
         if self.saved_layout is not None:
-            self.app.apply_layout(self.saved_layout, persist=False)
+            self.app.apply_layout(self.saved_layout, persist=False, starts=self.saved_starts)
             self.saved_layout = None
 
     # -- infrastructure -------------------------------------------------- #
@@ -237,7 +238,7 @@ class BenchContext:
         run = ExecutorRun(
             self.app.drone, mission_path,
             self.dir / "exec" / new_id("bench_exec"),
-            frame=LocalFrame.from_spec("L_exec"),
+            frame=self.app.local_frame("executor"), start=self.app.starts["executor"],
             registry_path=registry or self.registry)
         guard = 0
         while not run.done and guard < 20000:
@@ -326,20 +327,20 @@ def case_c1(ctx: BenchContext):
     started = time.time()
     case = CASES["C1"]
     details = []
-    lr = LOCAL_FRAMES["L_recon"]
-    le = LOCAL_FRAMES["L_exec"]
-    same_origin = (math.dist(lr["origin"], le["origin"]) < 0.01
-                   and abs(lr["yaw_deg"] - le["yaw_deg"]) < 0.5)
-    details.append(f"L_recon: начало {lr['origin']}, курс {lr['yaw_deg']}°")
-    details.append(f"L_exec: начало {le['origin']}, курс {le['yaw_deg']}°")
+    lr = ctx.app.local_frame("recon")
+    le = ctx.app.local_frame("executor")
+    distinct_origins = math.dist(lr.origin, le.origin) >= 0.01
+    details.append(f"L_recon: старт в F {lr.origin}, курс {lr.yaw_deg}°")
+    details.append(f"L_exec: старт в F {le.origin}, курс {le.yaw_deg}°")
 
     mission = yield from ctx.ensure_mission()
+    recon_landed = math.dist((ctx.app.drone.x, ctx.app.drone.y), lr.origin) < 0.01
     report = ctx._report or {}
     calib = report.get("calibration", {})
     transform = calib.get("local_to_field", {})
-    yaw_ok = abs(float(transform.get("yaw_deg", 0.0)) - lr["yaw_deg"]) < 1.0
-    tx_ok = abs(float(transform.get("tx", 99.0)) - lr["origin"][0]) < 0.03
-    ty_ok = abs(float(transform.get("ty", 99.0)) - lr["origin"][1]) < 0.03
+    yaw_ok = abs(float(transform.get("yaw_deg", 0.0)) - lr.yaw_deg) < 1.0
+    tx_ok = abs(float(transform.get("tx", 99.0)) - lr.origin[0]) < 0.03
+    ty_ok = abs(float(transform.get("ty", 99.0)) - lr.origin[1]) < 0.03
     scale_ok = abs(float(transform.get("scale", 0.0)) - 1.0) < 0.02
     details.append(
         f"оценка L_recon→F: масштаб {transform.get('scale', 0):.4f}, "
@@ -354,7 +355,11 @@ def case_c1(ctx: BenchContext):
 
     run = yield from ctx.fly(ctx._mission_path)
     confirmed = _confirmed(run)
-    landed = run.drone.alt <= 0.07
+    landed = (run.drone.alt <= 0.07
+              and math.dist((run.drone.x, run.drone.y), le.origin) < 0.01)
+    route_ok = bool(run.route_f) and run.route_f[0] == run.route_f[-1] == le.origin
+    details.append(f"возврат разведчика на свой старт={recon_landed}, "
+                   f"маршрут исполнителя замкнут на его старте={route_ok}")
     details.append(f"исполнитель: подтверждено {confirmed}/{len(targets)}, "
                    f"посадка {run.drone.alt:.3f} м")
     ctx.c1_run = run
@@ -362,7 +367,7 @@ def case_c1(ctx: BenchContext):
                           extra="оба локальных кадра → F")
     proof["снимок"] = ctx.shot("C1_after_flight")
 
-    passed = (not same_origin and yaw_ok and tx_ok and ty_ok and scale_ok
+    passed = (distinct_origins and recon_landed and route_ok and yaw_ok and tx_ok and ty_ok and scale_ok
               and classes_ok and frame_ok and confirmed == len(targets) and landed)
     received = (f"начала разные; перевод в F курс {transform.get('yaw_deg', 0):.2f}°; "
                 f"подтверждено {confirmed}/{len(targets)}; посадка {run.drone.alt:.2f} м")

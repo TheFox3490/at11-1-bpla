@@ -1,9 +1,8 @@
 """Capture a real 640x480 nadir frame from the Ursina window.
 
-The window is 16:9, the required frame is 4:3.  We temporarily point the camera
-down with a wider horizontal FOV, hide the UI and the artificial overlays, then
-crop the central 4:3 part and resize it to 640x480.  The crop is exactly the
-frame the drone camera would see.
+We temporarily point the camera down, hide the UI and overlays, and use a
+central 4:3 crop of the current framebuffer. The projection keeps the drone's
+horizontal FOV fixed even when the observer resizes the window.
 """
 from __future__ import annotations
 
@@ -30,6 +29,7 @@ class FrameGrabber:
         self.error: str | None = None
         self._saved = None
         self._crop = None
+        self._frame_size: tuple[int, int] | None = None
         self._path: Path | None = None
 
     def _collect_hidden(self) -> list:
@@ -56,32 +56,45 @@ class FrameGrabber:
         for e in self._hidden:
             e.visible = False
 
-        w, h = base.win.getXSize(), base.win.getYSize()
-        target_aspect = 4.0 / 3.0
-        aspect = w / float(h)
-        if aspect >= target_aspect:
-            crop_w, crop_h = int(round(h * target_aspect)), h
-            x0, y0 = (w - crop_w) // 2, 0
-        else:
-            crop_w, crop_h = w, int(round(w / target_aspect))
-            x0, y0 = 0, (h - crop_h) // 2
-        self._crop = (x0, y0, x0 + crop_w, y0 + crop_h)
-        frac = crop_w / float(w)
-        full_fov = math.degrees(2.0 * math.atan(math.tan(math.radians(HFOV / 2.0)) / frac))
         camera.position = (pose["x"], pose["alt"], pose["y"])
         camera.rotation = (90, 0, pose["yaw"])
-        camera.fov = full_fov
+        self._frame_size = None
+        self._fit_capture(*base.win.getSize())
         return True
+
+    def _fit_capture(self, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        self._frame_size = (width, height)
+        target_aspect = IMG_W / IMG_H
+        if width / height >= target_aspect:
+            crop_w, crop_h = round(height * target_aspect), height
+            x0, y0 = (width - crop_w) // 2, 0
+        else:
+            crop_w, crop_h = width, round(width / target_aspect)
+            x0, y0 = 0, (height - crop_h) // 2
+        self._crop = (x0, y0, x0 + crop_w, y0 + crop_h)
+        camera.fov = math.degrees(2 * math.atan(math.tan(math.radians(HFOV / 2)) * width / crop_w))
 
     def update(self) -> None:
         """Called once per rendered frame, before mode updates."""
         if not self.armed:
+            return
+        if base.win.getProperties().getMinimized():
+            self._frame_size = None
+            return
+        size = tuple(base.win.getSize())
+        if self._frame_size != size:
+            self._fit_capture(*size)
             return
         self.armed = False
         try:
             pnm = PNMImage()
             if not base.win.getScreenshot(pnm):
                 raise RuntimeError("window screenshot failed")
+            if (pnm.getXSize(), pnm.getYSize()) != size:
+                self.armed = True
+                return
             raw = self._path.with_suffix(".raw.png")
             if not pnm.write(Filename.fromOsSpecific(str(raw.resolve()))):
                 raise RuntimeError("PNMImage.write failed")
@@ -93,8 +106,9 @@ class FrameGrabber:
         except Exception as exc:  # keep the app alive, report the reason
             self.error = f"{type(exc).__name__}: {exc}"
         finally:
-            self._restore()
-            self.busy = False
+            if not self.armed:
+                self._restore()
+                self.busy = False
 
     def _restore(self) -> None:
         if self._saved is None:

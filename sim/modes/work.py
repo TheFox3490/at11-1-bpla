@@ -7,16 +7,15 @@ import threading
 import textwrap
 from pathlib import Path
 
-from ursina import camera, mouse
+from ursina import camera
 
 from cv.mission import apply_subset
 from cv.pipeline import run_pipeline_safe
 from cv.planner import plan
 from cv.validator import validate_mission
 from shared.contracts import new_id, write_json
-from shared.frames import LocalFrame
-from shared.world import EXEC_LIMIT_SECONDS, HOME, NO_FLY
-from sim import ui
+from shared.world import EXEC_LIMIT_SECONDS, NO_FLY
+from sim import scenario, ui
 from sim.modes.base import Mode
 from sim.recon import ReconRun
 
@@ -100,14 +99,23 @@ class WorkMode(Mode):
             text_size=0.56, danger=True, on_click=self.reset_work, name="work_reset_btn"))
 
         self.status = self.add_ui(ui.label(None, "", (-0.84, 0.005), scale=0.54,
-                                           tint=ui.INK))
+                                           tint=ui.INK, max_width=0.39, max_height=0.23))
+
+        self.add_ui(ui.label(None, "СТАРТЫ В F, м", (-0.84, -0.25),
+                             scale=0.49, tint=ui.MUTED))
+        self.start_labels = {}
+        for i, role in enumerate(scenario.START_NAMES):
+            self.start_labels[role] = self.add_ui(ui.label(
+                None, "", (-0.84, -0.287 - 0.034 * i), scale=0.49,
+                tint=ui.WARN if role == "recon" else ui.ACCENT))
 
         self.add_ui(ui.panel(position=(0.63, -0.02), scale=(0.46, 0.84),
                              tint=ui.PANEL_SOFT, name="work_report_panel"))
         self.add_ui(ui.label(None, "ОТЧЁТ", (0.42, 0.375), scale=0.76,
                              tint=ui.ACCENT))
         self.report_text = self.add_ui(ui.label(None, "", (0.42, 0.325),
-                                                scale=0.445, tint=ui.INK))
+                                                scale=0.445, tint=ui.INK,
+                                                max_width=0.42, max_height=0.735))
 
         # route preview banner (centre of the view, above the field)
         self.route_panel = self.add_ui(ui.panel(
@@ -115,20 +123,20 @@ class WorkMode(Mode):
             name="work_route_banner"))
         self.route_title = self.add_ui(ui.label(
             None, "", (0.0, 0.318), origin=(0.0, 0.0), scale=0.80,
-            tint=ui.GOOD))
+            tint=ui.GOOD, max_width=0.34))
         self.route_stats = self.add_ui(ui.label(
             None, "", (0.0, 0.286), origin=(0.0, 0.0), scale=0.54,
-            tint=ui.INK))
+            tint=ui.INK, max_width=0.34))
 
         # bottom strip: budget, priority and re-planning
         self.add_ui(ui.panel(position=(0.0, -0.402), scale=(0.79, 0.120),
                              tint=ui.PANEL, name="work_route_panel"))
         self.add_ui(ui.label(None, "БЮДЖЕТ, с", (-0.385, -0.362), scale=0.40,
-                             tint=ui.MUTED))
+                             tint=ui.MUTED, max_width=0.07))
         self.budget_buttons = {}
         for i, value in enumerate(BUDGETS):
             button = self.add_ui(ui.button(
-                None, f"{value:g}", (-0.305 + i * 0.070, -0.362),
+                None, f"{value:g}", (-0.282 + i * 0.070, -0.362),
                 scale=(0.062, 0.030), text_size=0.44,
                 on_click=lambda v=value: self.set_budget(v),
                 name=f"work_budget_{value:g}"))
@@ -136,7 +144,7 @@ class WorkMode(Mode):
         self.add_ui(ui.label(None, "ЦЕЛЬ", (-0.100, -0.362), scale=0.40,
                              tint=ui.MUTED))
         self.priority_text = self.add_ui(ui.label(None, "—", (-0.042, -0.362),
-                                                  scale=0.42, tint=ui.INK))
+                                                  scale=0.42, tint=ui.INK, max_width=0.08))
         self.add_ui(ui.button(None, "←", (0.058, -0.362), scale=(0.032, 0.030),
                               text_size=0.42, on_click=lambda: self.cycle_target(-1)))
         self.add_ui(ui.button(None, "P−", (0.098, -0.362), scale=(0.036, 0.030),
@@ -149,9 +157,9 @@ class WorkMode(Mode):
             None, "Пересчитать", (0.310, -0.362), scale=(0.120, 0.030),
             text_size=0.42, on_click=self.replan, name="work_replan_btn"))
         self.order_text = self.add_ui(ui.label(None, "", (-0.385, -0.404),
-                                               scale=0.42, tint=ui.INK))
+                                               scale=0.42, tint=ui.INK, max_width=0.77))
         self.compare_text = self.add_ui(ui.label(None, "", (-0.385, -0.438),
-                                                 scale=0.40, tint=ui.MUTED))
+                                                 scale=0.40, tint=ui.MUTED, max_width=0.77))
 
     # ------------------------------------------------------------------ #
     def _observer_camera(self) -> None:
@@ -161,14 +169,14 @@ class WorkMode(Mode):
         yaw = math.degrees(math.atan2(dx, dz))
         pitch = -math.degrees(math.atan2(dy, math.hypot(dx, dz)))
         camera.rotation = (pitch, yaw, 0)
-        camera.fov = 90.0
+        self.app.set_observer_fov(90.0)
 
     def on_enter(self) -> None:
         self._observer_camera()
-        mouse.locked = False
         self.app.scene.set_overlays(True)
+        self._show_starts()
         if self.phase not in {"recon", "cv", "exec"}:
-            self.app.drone.reset()
+            self.app.drone.reset(self.app.starts["recon"])
             self.app.drone.rig.set_role("neutral")
             self.app.scene.clear_trail()
         self._refresh_route_view()
@@ -184,6 +192,12 @@ class WorkMode(Mode):
             self.app.cancel_execution()
             if self.phase == "exec":
                 self.phase = "idle"
+        self.app.scene.hide_starts()
+
+    def _show_starts(self) -> None:
+        self.app.scene.show_starts(self.app.starts)
+        for role, (x, y) in self.app.starts.items():
+            self.start_labels[role].text = f"{scenario.START_NAMES[role]}: ({x:.3f}, {y:.3f})"
 
     # ------------------------------------------------------------------ #
     def _set_mission(self, result) -> None:
@@ -235,8 +249,10 @@ class WorkMode(Mode):
         self.app.drone.rig.set_role("recon")
         self.app.scene.clear_trail()
         self.recon = ReconRun(self.app.drone, self.app.grabber, self.run_dir,
-                              frame=LocalFrame.from_spec("L_recon"),
-                              set_calibration=self.app.scene.set_calibration_visible)
+                              frame=self.app.local_frame("recon"),
+                              set_calibration=self.app.scene.set_calibration_visible,
+                              start=self.app.starts["recon"],
+                              executor_start=self.app.starts["executor"])
         self.phase = "recon"
         self._observer_camera()
         self.app.scene.set_overlays(True)
@@ -319,7 +335,8 @@ class WorkMode(Mode):
         self._report_cache = ""
         self.app.clear_last_mission()
         self.app.scene.clear_route()
-        self.app.reset_drone("neutral")
+        self.app.drone.reset(self.app.starts["recon"])
+        self.app.drone.rig.set_role("neutral")
         self._observer_camera()
         self.app.scene.set_overlays(True)
 
@@ -338,6 +355,8 @@ class WorkMode(Mode):
         self._report_cache = ""
         self.app.clear_last_mission()
         self.app.scene.clear_route()
+        if self.app.mode is self:
+            self._show_starts()
         self._refresh_route_view()
 
     # ------------------------------------------------------------------ #
@@ -385,7 +404,8 @@ class WorkMode(Mode):
         targets = copy.deepcopy(self._targets())
         if not targets:
             return
-        planning = plan(HOME, targets, forbidden=NO_FLY, max_time=self.budget_s)
+        planning = plan(self.app.starts["executor"], targets,
+                        forbidden=NO_FLY, max_time=self.budget_s)
         mission = apply_subset(self.base_mission, planning, self.budget_s)
         errors = validate_mission(mission)
         self.plan = planning
@@ -409,7 +429,7 @@ class WorkMode(Mode):
             self.result.report["partial"] = bool(planning.get("skipped"))
             self.result.report["budget_s"] = round(self.budget_s, 1)
             self.result.report["plan"] = {k: planning.get(k) for k in
-                                          ("order", "route", "length_m", "estimated_s",
+                                           ("start", "order", "route", "length_m", "estimated_s",
                                            "reserve_s", "total_with_reserve_s", "method",
                                            "chosen_method", "comparison", "skipped",
                                            "valid", "budget_s")}
@@ -557,7 +577,7 @@ class WorkMode(Mode):
                 lines.append(f"бюджет: {plan_data.get('budget_s', self.budget_s):.0f} с")
                 lines.append(f"метод: {METHOD_LABEL.get(plan_data.get('method'), plan_data.get('method', '—'))}")
                 for method in plan_data.get("comparison") or []:
-                    mark = "✓" if method.get("method") == plan_data.get("chosen_method",
+                    mark = "•" if method.get("method") == plan_data.get("chosen_method",
                                                                          plan_data.get("method")) else " "
                     name = METHOD_LABEL.get(method.get("method"), method.get("method"))
                     lines.append(f"{mark} {name}: {method.get('length_m', 0):.2f} м, "

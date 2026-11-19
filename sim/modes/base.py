@@ -39,6 +39,9 @@ class Mode:
     def on_exit(self) -> None:
         pass
 
+    def update_frame(self) -> None:
+        pass
+
     def step(self, dt: float) -> None:
         pass
 

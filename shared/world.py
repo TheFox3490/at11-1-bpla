@@ -23,8 +23,9 @@ ALT_NOMINAL = 1.2
 ALT_MIN, ALT_MAX = 1.0, 1.4
 SPEED_LIMIT = 0.4
 
-# Take-off / landing point, metres in F.  Centre of the field is clear of plots.
+# Default for free flight, legacy missions and the executor's base layout.
 HOME = (3.0, 2.0)
+FLIGHT_FIELD_MARGIN = 0.15
 
 # Forbidden zone, metres in F (same polygon as sim/field.py).
 NO_FLY: list[tuple[float, float]] = [
@@ -69,8 +70,8 @@ RECON_LIMIT_SECONDS = 6 * 60
 PROCESS_LIMIT_SECONDS = 3 * 60
 EXEC_LIMIT_SECONDS = 6 * 60
 
-# Two independent local navigation frames, so the app cannot accidentally
-# pretend L and F are the same.  Values are arbitrary but fixed.
+# Legacy navigation frames for standalone runs. The app places each origin
+# at the corresponding take-off point and retains the independent headings.
 LOCAL_FRAMES = {
     "L_recon": {"origin": (0.20, 0.30), "yaw_deg": 7.0},
     "L_exec": {"origin": (5.55, 3.70), "yaw_deg": -160.0},

@@ -37,11 +37,14 @@ WARN = (240, 188, 78)
 
 
 def _font(size: int, bold: bool = False):
-    name = "arialbd.ttf" if bold else "arial.ttf"
-    try:
-        return ImageFont.truetype(name, size)
-    except OSError:
-        return ImageFont.load_default()
+    names = ("arialbd.ttf", "LiberationSans-Bold.ttf") if bold else (
+        "arial.ttf", "LiberationSans-Regular.ttf")
+    for name in names:
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return ImageFont.load_default(size=size)
 
 
 class MapCanvas:
@@ -66,7 +69,7 @@ class MapCanvas:
 
     def _base(self) -> None:
         d = self.d
-        d.text((self.PAD, 10), self.title, font=_font(15, True), fill=INK)
+        d.text((self.PAD, 10), self.title, font=_font(18, True), fill=INK)
         x0, y0 = self._px(0, FIELD_H)
         x1, y1 = self._px(FIELD_W, 0)
         d.rectangle([x0, y0, x1, y1], fill=(58, 44, 32), outline=(210, 210, 210), width=2)
@@ -77,8 +80,8 @@ class MapCanvas:
             gy0 = self._px(0, gy)[1]
             d.line([(x0, gy0), (x1, gy0)], fill=GRID, width=1)
         # coordinates hint
-        d.text((x1 + 4, y1 - 14), "x", font=_font(12), fill=(230, 120, 120))
-        d.text((x0 - 16, y0 - 16), "y", font=_font(12), fill=(120, 220, 150))
+        d.text((x1 + 4, y1 - 14), "x", font=_font(14), fill=(230, 120, 120))
+        d.text((x0 - 16, y0 - 16), "y", font=_font(14), fill=(120, 220, 150))
 
     def nfz(self, expanded: list | None = None) -> "MapCanvas":
         d = self.d
@@ -100,7 +103,7 @@ class MapCanvas:
                         fill=PLOT.get(str(obj.get("klass")), PLOT["U"]),
                         outline=(245, 245, 245), width=2)
             d.text(((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2),
-                   str(obj.get("klass", "?")), font=_font(13, True),
+                   str(obj.get("klass", "?")), font=_font(16, True),
                    fill=(20, 20, 20), anchor="mm")
         return self
 
@@ -134,8 +137,8 @@ class MapCanvas:
                 color=GOOD) -> "MapCanvas":
         for x, y, label, _kind in points:
             px, py = self._px(float(x), float(y))
-            self.d.ellipse([px - 9, py - 9, px + 9, py + 9], outline=color, width=2)
-            self.d.text((px, py), label, font=_font(11, True), fill=color, anchor="mm")
+            self.d.ellipse([px - 11, py - 11, px + 11, py + 11], outline=color, width=2)
+            self.d.text((px, py), label, font=_font(13, True), fill=color, anchor="mm")
         return self
 
     def cross(self, x: float, y: float, label: str, color=BAD) -> "MapCanvas":
@@ -143,22 +146,26 @@ class MapCanvas:
         self.d.line([px - 12, py - 12, px + 12, py + 12], fill=color, width=3)
         self.d.line([px - 12, py + 12, px + 12, py - 12], fill=color, width=3)
         if label:
-            self.d.text((px + 15, py - 8), label, font=_font(12, True), fill=color)
+            font = _font(14, True)
+            label_width = self.d.textlength(label, font=font)
+            label_x = px + 15 if px + 15 + label_width < self.w - 8 else px - 15 - label_width
+            self.d.text((max(8, label_x), max(self.PAD, py - 30)), label, font=font, fill=color)
         return self
 
     def skipped(self, x: float, y: float, label: str) -> "MapCanvas":
         px, py = self._px(float(x), float(y))
         self.d.rectangle([px - 9, py - 9, px + 9, py + 9], outline=WARN, width=2)
-        self.d.text((px + 12, py - 8), label, font=_font(11), fill=WARN)
+        self.d.text((px + 12, py - 8), label, font=_font(13), fill=WARN)
         return self
 
     def legend(self, rows: list[tuple[str, str]]) -> "MapCanvas":
         x = self.PAD
         y = self.h - 30
+        font = _font(13)
         for text, color in rows:
             self.d.rectangle([x, y + 3, x + 10, y + 13], fill=color)
-            self.d.text((x + 15, y), text, font=_font(11), fill=INK)
-            x += 16 + int(self.d.textlength(text, font=_font(11))) + 14
+            self.d.text((x + 15, y), text, font=font, fill=INK)
+            x += 16 + int(self.d.textlength(text, font=font)) + 14
         return self
 
     def save(self, path: str | Path) -> Path:
@@ -216,6 +223,7 @@ def draw_timeline(events: list[dict], path: str | Path,
         "mission_safely_ended": "посадка",
         "mission_done": "посадка",
     }
+    label_font = _font(11)
     for event in events:
         t = float(event.get("t_s", 0.0))
         name = str(event.get("event", ""))
@@ -224,11 +232,15 @@ def draw_timeline(events: list[dict], path: str | Path,
         d.line([(x, y - 16), (x, y + 16)], fill=color, width=2)
         text = labels.get(name)
         if text:
-            d.text((x + 3, y + 20), text, font=_font(10), fill=color)
+            label_x = min(x + 3, width - 8 - d.textlength(text, font=label_font))
+            label_y = y + (36 if name in {"led_confirmed", "mission_aborted"} else 20)
+            d.text((label_x, label_y), text, font=label_font, fill=color)
         if name in {"mission_aborted", "led_interrupted"} and event.get("reason"):
-            d.text((x + 3, y - 34), str(event["reason"])[:34], font=_font(10), fill=color)
-    d.text((left, y + 44), "0 с", font=_font(10), fill=MUTED)
-    d.text((right - 44, y + 44), f"{span:.0f} с", font=_font(10), fill=MUTED)
+            reason = str(event["reason"])[:34]
+            reason_x = min(x + 3, width - 8 - d.textlength(reason, font=label_font))
+            d.text((reason_x, y - 34), reason, font=label_font, fill=color)
+    d.text((left, y + 55), "0 с", font=label_font, fill=MUTED)
+    d.text((right - 44, y + 55), f"{span:.0f} с", font=label_font, fill=MUTED)
     img.save(path)
     return path
 

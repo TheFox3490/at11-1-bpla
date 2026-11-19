@@ -6,7 +6,9 @@ import time
 
 from ursina import Entity, color
 
-from shared.world import ALT_MAX, ALT_MIN, ALT_NOMINAL, FIELD_H, FIELD_W, HOME, SPEED_LIMIT
+from shared.world import (
+    ALT_MAX, ALT_MIN, ALT_NOMINAL, FIELD_H, FIELD_W, FLIGHT_FIELD_MARGIN, HOME, SPEED_LIMIT,
+)
 
 DRONE_SCALE = 1.6
 ROLE_COLORS = {
@@ -67,8 +69,8 @@ class Drone:
         self.speed_limit = SPEED_LIMIT
         self.reset()
 
-    def reset(self) -> None:
-        self.x, self.y = HOME
+    def reset(self, start: tuple[float, float] = HOME) -> None:
+        self.x, self.y = start
         self.alt = ALT_NOMINAL
         self.yaw = 0.0
         self.vx = self.vy = 0.0
@@ -133,8 +135,9 @@ class Drone:
             self.arrived = True
             self.alt_reached = True
 
-        self.x = max(0.15, min(FIELD_W - 0.15, self.x))
-        self.y = max(0.15, min(FIELD_H - 0.15, self.y))
+        margin = FLIGHT_FIELD_MARGIN
+        self.x = max(margin, min(FIELD_W - margin, self.x))
+        self.y = max(margin, min(FIELD_H - margin, self.y))
         if self.landing:
             self.alt = max(0.04, min(ALT_MAX, self.alt))
         else:

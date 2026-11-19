@@ -15,15 +15,51 @@ import pytest
 from cv.detect import Detection
 from cv.merge import merge_detections
 from cv.mission import apply_subset, build_mission
-from cv.planner import plan
+from cv.planner import plan, safe_leg
 from cv.validator import operation_gate, validate_mission
-from shared.contracts import checksum_of, new_id, utc_now
+from shared.contracts import checksum_of, new_id, utc_now, write_json
 from shared.journal import ActionRegistry
 from shared.world import (
     FORBIDDEN_EXPANSION, HOME, MAX_RECON_ERROR, NO_FLY,
     expand_polygon, segment_intersects_polygon,
 )
+from sim import scenario
 from tests.cases import build_bench_mission
+
+
+def test_layout_round_trips_both_starts_and_reads_legacy_files(tmp_path, monkeypatch):
+    path = tmp_path / "layout.json"
+    monkeypatch.setattr(scenario, "LAYOUT_PATH", path)
+    plots, defaults = scenario.load_layout()
+    assert defaults["recon"] != defaults["executor"]
+    write_json(path, {"version": 1, "objects": plots})
+    assert scenario.load_layout() == (plots, {"recon": HOME, "executor": HOME})
+    starts = {"recon": (1.5, 1.3), "executor": (5.65, 0.6)}
+    scenario.save_layout(plots, starts)
+    assert scenario.load_layout() == (plots, starts)
+
+
+@pytest.mark.parametrize(("point", "reason"), [
+    ((0.1, 2.0), "границы поля"),
+    ((4.47, 2.35), "расширенной запретной зоне"),
+    ((0.8, 0.8), "площадке калибровки"),
+    ((2.1, 0.75), "слишком близко к старту"),
+])
+def test_layout_checks_relocated_start(point, reason):
+    starts = {**scenario.default_starts(), "executor": point}
+    errors = scenario.validate(scenario.default_objects(), starts=starts)
+    assert any(reason in error and "Исполнитель" in error for error in errors)
+
+
+def test_return_to_relocated_start_has_safe_detour():
+    start = (5.65, 0.75)
+    point = (4.2, 2.2)
+    expanded = expand_polygon(NO_FLY, FORBIDDEN_EXPANSION)
+    assert segment_intersects_polygon(point, start, expanded)
+    path = safe_leg(point, start, NO_FLY)
+    assert path is not None and len(path) > 2
+    assert path[0] == point and path[-1] == start
+    assert all(not segment_intersects_polygon(a, b, expanded) for a, b in zip(path, path[1:]))
 
 
 def test_units_must_be_metres():

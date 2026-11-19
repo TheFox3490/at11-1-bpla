@@ -86,6 +86,9 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
     _progress(progress, "загрузка разведданных", 0.02)
     run = read_json(run_dir / "run.json")
     run_id = str(run["run_id"])
+    start_point = run.get("executor_start_f")
+    executor_start = ((float(start_point["x"]), float(start_point["y"]))
+                      if start_point is not None else HOME)
     if run.get("failed"):
         raise PipelineError(f"recon run failed: {run.get('error')}")
     frame_ids = [f for f in run.get("frames", []) if f != "calib"]
@@ -150,14 +153,14 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
     write_json(run_dir / "mission_full.json", full_mission)
     write_json(run_dir / "mission_candidate.json", mission)
 
-    planning = {"start": {"x": HOME[0], "y": HOME[1]}, "order": [], "targets": [],
+    planning = {"start": dict(zip(("x", "y"), executor_start)), "order": [], "targets": [],
                 "route": [], "length_m": 0.0, "estimated_s": 0.0,
                 "reserve_s": 0.0, "total_with_reserve_s": 0.0,
                 "method": "none", "comparison": [], "skipped": [],
                 "expanded_forbidden": [], "valid": False,
                 "budget_s": round(float(budget_s), 1)}
     if mission["targets"]:
-        planning = plan(HOME, mission["targets"], forbidden=NO_FLY,
+        planning = plan(executor_start, mission["targets"], forbidden=NO_FLY,
                         max_time=budget_s)
         mission = apply_subset(full_mission, planning, budget_s)
         write_json(run_dir / "mission_candidate.json", mission)
@@ -204,7 +207,7 @@ def run_pipeline(run_dir: str | Path, progress: Callable[[str, float], None] | N
         "mission_id": mission["mission_id"],
         "mission_path": str(mission_path),
         "plan": {k: planning.get(k) for k in
-                 ("order", "route", "length_m", "estimated_s", "reserve_s",
+                 ("start", "order", "route", "length_m", "estimated_s", "reserve_s",
                   "total_with_reserve_s", "method", "chosen_method", "comparison",
                   "skipped", "valid", "budget_s")},
     }

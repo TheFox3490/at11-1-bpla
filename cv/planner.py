@@ -17,8 +17,9 @@ import itertools
 import math
 
 from shared.world import (
-    EXEC_LIMIT_SECONDS, FORBIDDEN_EXPANSION, OPERATION_SECONDS, SPEED_LIMIT,
-    STABILIZE_SECONDS, NO_FLY, expand_polygon, segment_intersects_polygon,
+    EXEC_LIMIT_SECONDS, FIELD_H, FIELD_W, FLIGHT_FIELD_MARGIN, FORBIDDEN_EXPANSION,
+    OPERATION_SECONDS, SPEED_LIMIT, STABILIZE_SECONDS, NO_FLY, expand_polygon,
+    segment_intersects_polygon,
 )
 
 MAX_EXHAUSTIVE = 7
@@ -69,6 +70,21 @@ def _find_leg(a, b, expanded, detour_points):
             if length < best_len:
                 best_len, best = length, [a, v, w, b]
     return best
+
+
+def _route_geometry(forbidden: list[tuple[float, float]]):
+    expanded = expand_polygon(forbidden, FORBIDDEN_EXPANSION)
+    margin = FLIGHT_FIELD_MARGIN
+    # A bypass waypoint needs to be reachable by the drone and clear of the
+    # expanded zone rather than touching a vertex of that zone.
+    detour = [(x, y) for x, y in expand_polygon(forbidden, FORBIDDEN_EXPANSION + 0.02)
+              if margin <= x <= FIELD_W - margin and margin <= y <= FIELD_H - margin]
+    return expanded, detour
+
+
+def safe_leg(start: tuple[float, float], end: tuple[float, float],
+             forbidden: list[tuple[float, float]]) -> list[tuple[float, float]] | None:
+    return _find_leg(start, end, *_route_geometry(forbidden))
 
 
 def _route_for_order(order, start, expanded, detour_points):
@@ -184,10 +200,7 @@ def plan(start: tuple[float, float], targets: list[dict],
          speed: float = SPEED_LIMIT,
          max_time: float = EXEC_LIMIT_SECONDS) -> dict:
     forbidden = forbidden or NO_FLY
-    expanded = expand_polygon(forbidden, FORBIDDEN_EXPANSION)
-    # Detour points sit slightly outside the expanded zone so a segment does
-    # not merely touch it.
-    detour = expand_polygon(forbidden, FORBIDDEN_EXPANSION + 0.02)
+    expanded, detour = _route_geometry(forbidden)
     remaining = [dict(t) for t in targets]
     skipped: list[dict] = []
     comparison: list[dict] = []

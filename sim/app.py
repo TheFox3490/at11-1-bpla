@@ -19,7 +19,7 @@ from ursina import (  # noqa: E402
 
 from shared.contracts import new_id  # noqa: E402
 from shared.frames import LocalFrame  # noqa: E402
-from shared.world import EXEC_LIMIT_SECONDS  # noqa: E402
+from shared.world import EXEC_LIMIT_SECONDS, HOME, LOCAL_FRAMES  # noqa: E402
 from sim import scenario, ui  # noqa: E402
 from sim.capture import FrameGrabber  # noqa: E402
 from sim.drone import Drone  # noqa: E402
@@ -39,17 +39,21 @@ class Application:
         ui.configure_fonts()
         self.ursina = Ursina(
             title="BPLA AT11-2 — 3 режима",
-            size=(1280, 720),
+            size=ui.DESIGN_SIZE,
             borderless=False,
             development_mode=False,
             editor_ui_enabled=False,
             show_ursina_splash=False,
         )
+        ui.create_canvas()
         window.color = color.rgb32(128, 176, 222)
         Sky()
-        self.layout = scenario.load_layout()
+        self.layout, self.starts = scenario.load_layout()
         self.scene = WorldScene(layout=self.layout)
         self.grabber = FrameGrabber(self.scene.capture_hidden_entities)
+        self._viewport_size = (0, 0)
+        self._observer_fov = 90.0
+        self._display_fov = self._observer_fov
         self.drone = Drone(self.scene.rig)
         self.speed = 1.0
         self.mode = None
@@ -67,6 +71,7 @@ class Application:
             "work": WorkMode(self),
         }
         self.bench = BenchOverlay(self)
+        self._sync_viewport()
         self.set_speed(1.0)
         self.set_mode("free")
 
@@ -117,32 +122,63 @@ class Application:
         for f, button in self.speed_buttons.items():
             ui.highlight_button(button, abs(f - self.speed) < 1e-9)
 
+    def set_observer_fov(self, horizontal_fov: float) -> None:
+        self._observer_fov = horizontal_fov
+        self._fit_observer_fov()
+
+    def _fit_observer_fov(self) -> None:
+        width, height = self._viewport_size
+        if width > 0 and height > 0:
+            extra_width = max(1.0, width / height / ui.DESIGN_ASPECT)
+            half_angle = math.radians(self._observer_fov / 2)
+            self._display_fov = math.degrees(2 * math.atan(math.tan(half_angle) * extra_width))
+            if not self.grabber.busy:
+                camera.fov = self._display_fov
+
+    def _sync_viewport(self) -> None:
+        width, height = self.ursina.win.getSize()
+        if width <= 0 or height <= 0:
+            return
+        if self._viewport_size != (width, height):
+            self._viewport_size = (width, height)
+            ui.fit_canvas(width / height)
+            self._fit_observer_fov()
+        elif not self.grabber.busy and camera.fov != self._display_fov:
+            camera.fov = self._display_fov
+
     def reset_drone(self, role: str = "neutral", reset_led: bool = True) -> None:
-        self.drone.reset()
+        self.drone.reset(self.starts.get(role, HOME))
         self.drone.rig.set_role(role)
         if reset_led:
             self.scene.rig.set_led(False)
         self.scene.sync_visuals(self.drone.alt)
 
-    def apply_layout(self, objects: list[dict], persist: bool = True) -> list[str]:
+    def local_frame(self, role: str) -> LocalFrame:
+        name = "L_recon" if role == "recon" else "L_exec"
+        return LocalFrame(name, self.starts[role], LOCAL_FRAMES[name]["yaw_deg"])
+
+    def apply_layout(self, objects: list[dict], persist: bool = True, *,
+                     starts: dict[str, tuple[float, float]] | None = None) -> list[str]:
         """Make an edited layout the physical field; returns validation errors.
 
         ``persist=False`` is used by the selftest so a diagnostic run never
         overwrites the layout the operator saved.
         """
-        errors = scenario.validate(objects)
+        starts = dict(self.starts if starts is None else starts)
+        errors = scenario.validate(objects, starts=starts)
         if errors:
             return errors
-        self.scene.set_layout(objects)
         if persist:
-            scenario.save_layout(objects)
+            scenario.save_layout(objects, starts)
         self.layout = scenario.copy_objects(objects)
+        self.starts = starts
+        self.scene.set_layout(self.layout)
         work = getattr(self, "modes", {}).get("work")
         if work is not None:
             work.on_layout_applied()
         manual = getattr(self, "modes", {}).get("manual")
         if manual is not None:
-            manual.sync_applied(self.layout)
+            manual.sync_applied(self.layout, self.starts)
         return []
 
     # ------------------------------------------------------------------ #
@@ -151,7 +187,7 @@ class Application:
                        faults: dict | None = None) -> ExecutorRun:
         run_dir = RUNS_DIR / new_id("exec")
         run = ExecutorRun(self.drone, mission_path, run_dir,
-                          frame=LocalFrame.from_spec("L_exec"),
+                          frame=self.local_frame("executor"), start=self.starts["executor"],
                           registry_path=registry_path or self.registry_path,
                           faults=faults)
         self.execution = run
@@ -189,6 +225,8 @@ class Application:
     # ------------------------------------------------------------------ #
     def update(self) -> None:
         self.grabber.update()
+        self._sync_viewport()
+        self.mode.update_frame()
 
         real_dt = min(ursina_time.dt, 0.10)
         total = max(0.0, real_dt * self.speed)
@@ -267,6 +305,7 @@ def run_selftest(app: Application) -> None:
     failures: list[str] = []
     step = app.ursina.step
     saved_layout = scenario.copy_objects(app.layout)
+    saved_starts = dict(app.starts)
 
     def check(name: str, condition: bool, detail: str = "") -> None:
         print(f"  {'PASS' if condition else 'FAIL'}  {name} {detail}")
@@ -295,14 +334,21 @@ def run_selftest(app: Application) -> None:
     try:
         print("2) конструктор поля: проверка и применение")
         work = app.modes["work"]
+        manual = app.modes["manual"]
+        starts = {"recon": (1.40, 1.15), "executor": (3.30, 2.00)}
         custom = [
             {"id": "P01", "klass": "A", "x": 1.0, "y": 0.8, "priority": 1},
             {"id": "P02", "klass": "A", "x": 1.8, "y": 0.8, "priority": 2},
             {"id": "P03", "klass": "A", "x": 2.6, "y": 0.8, "priority": 3},
             {"id": "P04", "klass": "B", "x": 1.0, "y": 1.6, "priority": 4},
         ]
-        errors = app.apply_layout(custom, persist=False)
+        manual.set_start("recon", starts["recon"])
+        manual.set_start("executor", starts["executor"])
+        check("editor changes starts in the draft only",
+              manual.dirty and manual.starts == starts and app.starts == saved_starts)
+        errors = app.apply_layout(custom, persist=False, starts=manual.starts)
         check("custom field applies", not errors, f"errors={errors}")
+        check("custom starts apply with the layout", app.starts == starts)
         check("scene rebuilt from the layout",
               set(app.scene.plot_entities) == {o["id"] for o in custom})
         check("layout change drops the previous mission",
@@ -319,7 +365,6 @@ def run_selftest(app: Application) -> None:
               f"got {len(app.scene.plot_entities)}")
 
         print("3) ручная карта и миссия")
-        manual = app.modes["manual"]
         manual.clear_map()
         manual.set_class("A")
         for x, y in [(2.1, 0.7), (3.0, 1.4), (4.0, 0.7),
@@ -350,6 +395,9 @@ def run_selftest(app: Application) -> None:
         check("calibration markers hidden before recon",
               not any(e.visible for e in app.scene.calib_entities))
         work.start_recon()
+        check("recon starts at its local origin",
+              (app.drone.x, app.drone.y) == starts["recon"]
+              and work.recon.frame.to_local(*starts["recon"]) == (0.0, 0.0))
         deadline = time.time() + 240.0
         last_note = 0
         calib_seen_visible = False
@@ -370,6 +418,8 @@ def run_selftest(app: Application) -> None:
                       f"{work.recon.expected_captures}, t={work.recon.t:.1f}s")
         check("recon completed", work.recon is not None and work.recon.done and not work.recon.error,
               work.recon.error if work.recon else "no recon")
+        check("recon returns to its own start",
+              math.dist((app.drone.x, app.drone.y), starts["recon"]) < 0.01)
         check("calibration markers shown only for the calibration frame",
               calib_seen_visible and not calib_visible_wrongly)
         check("calibration markers hidden after recon",
@@ -424,7 +474,15 @@ def run_selftest(app: Application) -> None:
               bool(work.mission) and len(work.mission.get("targets", [])) == 6)
 
         if work.mission_valid:
+            route = work.plan["route"]
+            check("preview route starts and ends at the executor's start",
+                  all((point["x"], point["y"]) == starts["executor"]
+                      for point in (route[0], route[-1])))
             work.start_executor()
+            check("executor starts at its local origin",
+                  (app.drone.x, app.drone.y) == starts["executor"]
+                  and app.execution is not None
+                  and app.execution.frame.to_local(*starts["executor"]) == (0.0, 0.0))
             deadline = time.time() + 180.0
             while time.time() < deadline:
                 step()
@@ -439,6 +497,8 @@ def run_selftest(app: Application) -> None:
                       f"{confirmed}/{len(run.plan.get('targets', []))}")
                 check("drone landed", run.drone.alt <= 0.07,
                       f"alt={run.drone.alt:.3f}")
+                check("executor returns to its own start",
+                      math.dist((run.drone.x, run.drone.y), starts["executor"]) < 0.01)
 
             print("6) реестр действий: повторный запуск")
             work.start_executor()
@@ -459,7 +519,7 @@ def run_selftest(app: Application) -> None:
                       f"confirmed={confirmed2} blocked={blocked2}/{total2}")
     finally:
         app.set_mode("manual")
-        app.apply_layout(saved_layout, persist=False)
+        app.apply_layout(saved_layout, persist=False, starts=saved_starts)
 
     print("\nselftest:", "OK" if not failures else f"FAILED {failures}")
 

@@ -14,7 +14,7 @@ from shared.contracts import file_sha256, iso, new_id, utc_now, write_json
 from shared.frames import LocalFrame
 from shared.world import (
     ALT_MAX, ALT_MIN, ALT_NOMINAL, CALIB_MARKERS, CHECK_MARKERS, FIELD_H, FIELD_W,
-    HFOV, IMG_H, IMG_W, RECON_LIMIT_SECONDS, SPEED_LIMIT,
+    HFOV, HOME, IMG_H, IMG_W, RECON_LIMIT_SECONDS, SPEED_LIMIT,
 )
 from sim.capture import FrameGrabber
 from sim.drone import Drone
@@ -37,10 +37,14 @@ def scan_path_f() -> list[tuple[float, float]]:
 class ReconRun:
     def __init__(self, drone: Drone, grabber: FrameGrabber, run_dir: str | Path,
                  frame: LocalFrame | None = None,
-                 set_calibration=None):
+                 set_calibration=None, *, start: tuple[float, float] = HOME,
+                 executor_start: tuple[float, float] = HOME):
         self.drone = drone
         self.grabber = grabber
         self.frame = frame or LocalFrame.from_spec("L_recon")
+        self.start = start
+        self.home_l = self.frame.to_local(*start)
+        self.executor_start = executor_start
         self.set_calibration = set_calibration or (lambda on: None)
         self.run_dir = Path(run_dir)
         self.frames_dir = self.run_dir / "frames"
@@ -67,7 +71,7 @@ class ReconRun:
         self.expected_captures = 1 + len(self.path_l)
         self.set_calibration(False)
 
-        self.drone.reset()
+        self.drone.reset(self.start)
         self.drone.speed_limit = SPEED_LIMIT
         self._goto_calib()
 
@@ -88,8 +92,7 @@ class ReconRun:
         }.get(self.phase, self.phase)
 
     def _goto_calib(self) -> None:
-        self.drone.goto(self.frame.to_field(*self.calib_l)[0],
-                        self.frame.to_field(*self.calib_l)[1], ALT_NOMINAL)
+        self.drone.goto(*self.frame.to_field(*self.calib_l), ALT_NOMINAL)
 
     def _goto_waypoint(self) -> None:
         lx, ly = self.path_l[self.index]
@@ -149,9 +152,7 @@ class ReconRun:
             self._goto_waypoint()
         else:
             self.phase = "to_home"
-            self.drone.goto(self.frame.to_field(*self.frame.to_local(3.0, 2.0))[0],
-                            self.frame.to_field(*self.frame.to_local(3.0, 2.0))[1],
-                            ALT_NOMINAL)
+            self.drone.goto(*self.frame.to_field(*self.home_l), ALT_NOMINAL)
 
     def _fail(self, message: str) -> None:
         self.set_calibration(False)
@@ -174,6 +175,8 @@ class ReconRun:
                        "pattern": "snake, 3 lanes x 8 stations",
                        "lane_y_m": list(LANES_Y)},
             "local_frame": self.frame.name,
+            "start_f": dict(zip(("x", "y"), self.start)),
+            "executor_start_f": dict(zip(("x", "y"), self.executor_start)),
             "calibration": {
                 "calib_id": f"calib_{self.run_id}",
                 "markers": {k: {"x": v[0], "y": v[1]} for k, v in CALIB_MARKERS.items()},
@@ -224,9 +227,7 @@ class ReconRun:
             self.drone.update(dt)
             if self.phase == "to_home" and self.drone.arrived and self.drone.alt_reached:
                 self.phase = "land"
-                home = self.frame.to_local(3.0, 2.0)
-                fx, fy = self.frame.to_field(*home)
-                self.drone.goto(fx, fy, 0.05, landing=True)
+                self.drone.goto(*self.frame.to_field(*self.home_l), 0.05, landing=True)
             elif self.phase == "land" and self.drone.arrived and self.drone.alt <= 0.06:
                 self.phase = "done"
                 self.done = True

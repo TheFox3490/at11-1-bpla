@@ -23,6 +23,7 @@ from shared.world import (
     FIELD_H, FIELD_W, MAP_TTL_SECONDS, NO_FLY, RECON_ERROR,
 )
 from sim import scenario, ui
+from sim.drone import ROLE_COLORS
 from sim.modes.base import Mode
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -76,6 +77,9 @@ class ManualMode(Mode):
         super().__init__(app)
         self.objects: list[dict] = scenario.copy_objects(app.layout)
         self.applied: list[dict] = scenario.copy_objects(app.layout)
+        self.starts = dict(app.starts)
+        self.applied_starts = dict(app.starts)
+        self.start_tool: str | None = None
         self.markers: dict[str, ManualMarker] = {}
         self.selected: dict | None = None
         self.current_class = "A"
@@ -103,8 +107,14 @@ class ManualMode(Mode):
                              tint=ui.PANEL, name="manual_panel"))
         self.add_ui(ui.label(None, "КОНСТРУКТОР ПОЛЯ", (-0.84, 0.375),
                              scale=0.74, tint=ui.ACCENT))
-        self.add_ui(ui.label(None, "правки меняют полигон\nдля режима 3 · координаты\nдаёт только CV",
-                             (-0.84, 0.315), scale=0.48, tint=ui.WARN))
+        self.add_ui(ui.label(None, "СТАРТ В F · ВЫБЕРИТЕ И УКАЖИТЕ НА ПОЛЕ",
+                             (-0.84, 0.309), scale=0.44, tint=ui.MUTED))
+        self.start_buttons = {}
+        for i, (role, name) in enumerate(scenario.START_NAMES.items()):
+            self.start_buttons[role] = self.add_ui(ui.button(
+                None, name, (-0.75 + 0.21 * i, 0.254), scale=(0.19, 0.041),
+                text_size=0.60, on_click=lambda r=role: self.select_start(r),
+                name=f"manual_start_{role}"))
         self.add_ui(ui.label(None, "КЛАСС ОБЪЕКТА", (-0.84, 0.205),
                              scale=0.53, tint=ui.MUTED))
 
@@ -149,35 +159,43 @@ class ManualMode(Mode):
             None, "Запустить исполнитель", (-0.645, -0.222),
             scale=(0.36, 0.038), on_click=self.launch_executor))
         self.status = self.add_ui(ui.label(None, "", (-0.84, -0.262), scale=0.50,
-                                           tint=ui.INK))
+                                           tint=ui.INK, max_width=0.39))
 
         self.add_ui(ui.panel(position=(0.63, -0.02), scale=(0.46, 0.84),
                              tint=ui.PANEL_SOFT, name="manual_check_panel"))
         self.add_ui(ui.label(None, "ПРОВЕРКА КАРТЫ", (0.42, 0.375), scale=0.68,
                              tint=ui.ACCENT))
-        self.check_text = self.add_ui(ui.label(None, "", (0.42, 0.325), scale=0.475,
-                                               tint=ui.INK))
+        self.add_ui(ui.label(None, "СТАРТЫ В F, м", (0.42, 0.324),
+                             scale=0.48, tint=ui.MUTED))
+        self.start_labels = {}
+        for i, role in enumerate(scenario.START_NAMES):
+            self.start_labels[role] = self.add_ui(ui.label(
+                None, "", (0.42, 0.296 - 0.026 * i), scale=0.53,
+                tint=ui.WARN if role == "recon" else ui.ACCENT))
+        self.check_text = self.add_ui(ui.label(None, "", (0.42, 0.218), scale=0.475,
+                                               tint=ui.INK, max_width=0.42, max_height=0.63))
 
         self.add_ui(ui.label(
-            None, "ЛКМ — поставить / выбрать и перетащить · ПКМ — удалить · "
-            "1/2/3 — класс · синяя рамка — зона калибровки",
-            (0.0, -0.467), origin=(-0.5, 0.5), scale=0.55, tint=ui.MUTED))
+            None, "Участки: ЛКМ — поставить или перетащить, ПКМ — удалить, 1/2/3 — класс",
+            (0.0, -0.467), origin=(0, 0.5), scale=0.48, tint=ui.MUTED))
 
     # ------------------------------------------------------------------ #
     def on_enter(self) -> None:
         camera.position = (FIELD_W / 2, 7.2, FIELD_H / 2)
         camera.rotation = (90, 0, 0)
-        camera.fov = 86.0
-        mouse.locked = False
+        self.app.set_observer_fov(86.0)
         self._active = True
         self.app.scene.set_overlays(True)
         self.app.scene.set_calibration_zone_visible(True)
         self.marker_root.enabled = True
-        self.app.drone.reset()
-        self.app.drone.rig.set_role("neutral")
+        self.app.reset_drone("neutral")
+        self.app.drone.rig.root.enabled = False
+        self.app.scene.plumb.visible = False
+        self.app.scene.spot.visible = False
         self.app.scene.clear_trail()
         self._preview()
         self._sync_markers()
+        self._refresh_tools()
         self.validate_map_ui()
 
     def on_exit(self) -> None:
@@ -188,18 +206,46 @@ class ManualMode(Mode):
         self._was_left = False
         # The draft is only a preview; the physical field is what was applied.
         self.app.scene.set_layout(self.applied)
+        self.app.scene.hide_starts()
         if self.app.execution is not None and self.app.execution_source is self:
             self.app.cancel_execution()
+        self.app.drone.rig.root.enabled = True
 
     def _preview(self) -> None:
         if self._active:
             self.app.scene.set_layout(self.objects)
+            self.app.scene.show_starts(self.starts)
 
     # ------------------------------------------------------------------ #
     def set_class(self, klass: str) -> None:
         self.current_class = klass
+        self.start_tool = None
+        self._refresh_tools()
+        self.validate_map_ui()
+
+    def select_start(self, role: str) -> None:
+        self.start_tool = role if self.start_tool != role else None
+        self.selected = None
+        self.drag = None
+        self._sync_markers()
+        self._refresh_tools()
+        self.validate_map_ui()
+
+    def _refresh_tools(self) -> None:
         for k, button in self.class_buttons.items():
-            ui.highlight_button(button, k == klass)
+            ui.highlight_button(button, self.start_tool is None and k == self.current_class)
+        for role, button in self.start_buttons.items():
+            tint = color.rgb32(*(round(c * 0.54) for c in ROLE_COLORS[role]))
+            ui.highlight_button(button, role == self.start_tool, active_tint=tint)
+            button.text_entity.color = ui.WARN if role == "recon" else ui.ACCENT
+
+    def set_start(self, role: str, point: tuple[float, float]) -> None:
+        self.starts[role] = tuple(round(value, 3) for value in point)
+        self.dirty = not self._same_as_applied()
+        self.invalidate_mission()
+        if self._active:
+            self.app.scene.show_starts(self.starts)
+        self.validate_map_ui()
 
     def add_object(self, x: float, y: float, klass: str | None = None) -> dict:
         klass = klass or self.current_class
@@ -236,39 +282,37 @@ class ManualMode(Mode):
 
     def load_demo_map(self) -> None:
         """Load the task's base layout as a draft (kept for --map-demo)."""
+        self.starts = scenario.default_starts()
         self._replace_draft(scenario.default_objects())
         self.selected = None
         self.last_exec = ""
         self.validate_map_ui()
 
     def revert_to_applied(self) -> None:
+        self.starts = dict(self.applied_starts)
         self._replace_draft(self.applied)
         self.selected = None
         self.last_exec = ""
         self.validate_map_ui()
 
-    def sync_applied(self, objects: list[dict]) -> None:
+    def sync_applied(self, objects: list[dict], starts: dict[str, tuple[float, float]]) -> None:
         """The field changed elsewhere: keep the applied baseline honest."""
         self.applied = scenario.copy_objects(objects)
+        self.applied_starts = dict(starts)
         if not self.dirty:
-            for marker in self.markers.values():
-                marker.destroy()
-            self.markers.clear()
             self.objects = scenario.copy_objects(objects)
-            for obj in self.objects:
-                self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
+            self.starts = dict(starts)
+            self._rebuild_markers()
             self.selected = None
-            self._preview()
             self._sync_markers()
+        self.dirty = not self._same_as_applied()
+        if self._active:
+            self.app.scene.show_starts(self.starts)
         self.validate_map_ui()
 
     def _replace_draft(self, objects: list[dict]) -> None:
-        for marker in self.markers.values():
-            marker.destroy()
-        self.markers.clear()
         self.objects = scenario.copy_objects(objects)
-        for obj in self.objects:
-            self.markers[obj["id"]] = ManualMarker(self.marker_root, obj)
+        self._rebuild_markers()
         self.selected = None
         self._touch()
 
@@ -276,7 +320,8 @@ class ManualMode(Mode):
         def key(obj):
             return (str(obj["id"]), str(obj["klass"]), round(float(obj["x"]), 3),
                     round(float(obj["y"]), 3), int(obj.get("priority", 0)))
-        return sorted(map(key, self.objects)) == sorted(map(key, self.applied))
+        return (self.starts == self.applied_starts
+                and sorted(map(key, self.objects)) == sorted(map(key, self.applied)))
 
     def _touch(self) -> None:
         self.dirty = not self._same_as_applied()
@@ -307,11 +352,13 @@ class ManualMode(Mode):
         return 0.0 <= point[0] <= FIELD_W and 0.0 <= point[1] <= FIELD_H
 
     def step(self, dt: float) -> None:
-        point = None if ui.pointer_over_ui() else ui.field_point_under_mouse()
+        point = ui.field_point_under_mouse(self.app.scene.field_entity)
         self._hover_point = point if point and self._valid_point(point) else None
 
         if mouse.left and not self._was_left:
-            if self._hover_point is not None:
+            if self._hover_point is not None and self.start_tool is not None:
+                self.set_start(self.start_tool, self._hover_point)
+            elif self._hover_point is not None:
                 hit = self.nearest(self._hover_point, 0.26)
                 if hit is not None:
                     self.selected = hit
@@ -330,10 +377,12 @@ class ManualMode(Mode):
 
         if not mouse.left and self._was_left:
             if self.drag is not None:
-                self._preview()
+                self._touch()
+                self.validate_map_ui()
             self.drag = None
 
-        if mouse.right and not self._was_right and self._hover_point is not None:
+        if (mouse.right and not self._was_right and self._hover_point is not None
+                and self.start_tool is None):
             hit = self.nearest(self._hover_point, 0.26)
             if hit is not None:
                 self.remove_object(hit)
@@ -350,9 +399,12 @@ class ManualMode(Mode):
         elif key == "v":
             self.validate_map_ui()
         elif key == "escape":
+            self.start_tool = None
             self.selected = None
             self.drag = None
             self._sync_markers()
+            self._refresh_tools()
+            self.validate_map_ui()
 
     # ------------------------------------------------------------------ #
     def _field_busy(self) -> str | None:
@@ -369,18 +421,17 @@ class ManualMode(Mode):
             self.layout_errors = [busy]
             self.validate_map_ui()
             return
-        errors = self.app.apply_layout(self.objects)
+        errors = self.app.apply_layout(self.objects, starts=self.starts)
         if errors:
             self.layout_errors = errors
             self.last_exec = ""
             self.validate_map_ui()
             return
-        self.applied = scenario.copy_objects(self.objects)
-        self.dirty = False
         self.layout_errors = []
-        self.last_exec = ("поле обновлено: режим 3 полетит по этой карте"
-                          if not scenario.is_default(self.objects)
-                          else "восстановлена базовая раскладка")
+        self.last_exec = ("восстановлены базовое поле и старты"
+                          if self.starts == scenario.default_starts()
+                          and scenario.is_default(self.objects)
+                          else "поле и старты применены для режима 3")
         self.validate_map_ui()
 
     def _evaluate(self) -> tuple[list[dict], list[dict]]:
@@ -411,13 +462,15 @@ class ManualMode(Mode):
             f"допустимых A: {len(accepted)}",
             "",
         ]
+        for role, (x, y) in self.starts.items():
+            self.start_labels[role].text = f"{scenario.START_NAMES[role]}: ({x:.3f}, {y:.3f})"
         if self.selected:
             o = self.selected
             lines += [f"выбран {o['id']}  класс {o['klass']}",
                       f"x={o['x']:.3f}  y={o['y']:.3f}  P={o['priority']}", ""]
         else:
             lines += ["объект не выбран", ""]
-        layout_errors = scenario.validate(self.objects) if self.objects else ["карта пуста"]
+        layout_errors = scenario.validate(self.objects, starts=self.starts)
         self.layout_errors = layout_errors
         if layout_errors:
             lines.append("ПОЛИГОН: нельзя применить")
@@ -442,8 +495,10 @@ class ManualMode(Mode):
         self.check_text.text = "\n".join(wrapped[:34])
         applied_state = "применено" if not self.dirty else "есть правки"
         extra = self.layout_errors[0] if self.layout_errors else ""
+        tool = (f"старт: {scenario.START_NAMES[self.start_tool]} (ЛКМ)"
+                if self.start_tool else f"класс: {CLASS_NAMES[self.current_class]}")
         self.status.text = (
-            f"класс: {CLASS_NAMES[self.current_class]}\n"
+            f"{tool}\n"
             f"поле: {applied_state} · объектов: {len(self.objects)}\n"
             f"допустимых A: {len(accepted)}"
             + (f"\n{extra[:46]}" if extra else "")
@@ -531,9 +586,11 @@ class ManualMode(Mode):
         self.validate_map_ui()
 
     def launch_executor(self) -> None:
-        if not self.mission_path or not self.mission_valid:
+        if not self.mission_path or not self.mission_valid or self.app.execution is not None:
             return
         self.last_exec = "исполнитель запущен"
+        self.app.drone.rig.root.enabled = True
+        self.app.scene.set_overlays(True)
         self.app.drone.rig.set_role("executor")
         self.app.scene.clear_trail()
         self.app.start_executor(self.mission_path, source=self)
@@ -550,5 +607,3 @@ class ManualMode(Mode):
     def refresh(self) -> None:
         accepts = self.mission_path is not None and self.mission_valid
         ui.set_button(self.launch_btn, accepts and self.app.execution is None)
-        for klass, button in self.class_buttons.items():
-            ui.highlight_button(button, klass == self.current_class)

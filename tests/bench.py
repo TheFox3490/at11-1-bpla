@@ -11,7 +11,7 @@ import textwrap
 import time
 from pathlib import Path
 
-from ursina import Entity, Texture, camera, color
+from ursina import Entity, Texture, color
 
 from shared.contracts import new_id
 from sim import ui
@@ -94,9 +94,10 @@ class BenchOverlay:
             add(ui.label(None, cid, (-0.852, row_y + 0.008), scale=0.46,
                          tint=ui.INK))
             add(ui.label(None, SHORT_TITLE.get(cid, case.title),
-                         (-0.812, row_y + 0.008), scale=0.38, tint=ui.MUTED))
+                         (-0.812, row_y + 0.008), scale=0.38, tint=ui.MUTED,
+                         max_width=0.155))
             state = add(ui.label(None, "—", (-0.648, row_y + 0.008), scale=0.40,
-                                 tint=ui.MUTED))
+                                 tint=ui.MUTED, max_width=0.032))
             button = add(ui.button(None, ">", (-0.592, row_y + 0.006),
                                    scale=(0.040, 0.028), text_size=0.44,
                                    on_click=lambda c=cid: self.start_one(c),
@@ -106,41 +107,40 @@ class BenchOverlay:
 
         add(ui.label(
             None, "F9 — закрыть · протокол в runs/tests/\nсценарии идут на реальном поле",
-            (-0.855, -0.398), scale=0.36, tint=ui.MUTED))
+            (-0.855, -0.398), scale=0.36, tint=ui.MUTED, max_width=0.28))
 
         # top banner: what is running now
         self.now_title = add(ui.label(None, "стенд готов", (0.0, 0.416),
                                       origin=(0.0, 0.0), scale=0.58,
-                                      tint=ui.INK))
+                                      tint=ui.INK, max_width=0.75))
         self.now_text = add(ui.label(None, "выберите сценарий или «Прогнать все»",
                                      (0.0, 0.386), origin=(0.0, 0.0),
-                                     scale=0.42, tint=ui.MUTED))
+                                     scale=0.42, tint=ui.MUTED, max_width=0.75))
 
         # right card
         add(ui.label(None, "СЦЕНАРИЙ", (0.578, 0.388), scale=0.40, tint=ui.MUTED))
         self.case_title = add(ui.label(None, "—", (0.582, 0.348), scale=0.48,
-                                       tint=ui.ACCENT))
+                                       tint=ui.ACCENT, max_width=0.265))
         self.case_expected = add(ui.label(
             None, "слева выберите сценарий\nили «Прогнать все».\n\n"
                   "каждый сценарий идёт на\nреальном поле: маршрут,\n"
                   "дрон и журнал — настоящие.",
-            (0.582, 0.314), scale=0.35, tint=ui.MUTED))
+            (0.582, 0.314), scale=0.35, tint=ui.MUTED, max_width=0.265, max_height=0.06))
         self.case_received = add(ui.label(None, "", (0.582, 0.246), scale=0.35,
-                                          tint=ui.INK))
+                                          tint=ui.INK, max_width=0.265, max_height=0.085))
         self.case_details = add(ui.label(None, "", (0.582, 0.152), scale=0.32,
-                                         tint=ui.MUTED))
+                                         tint=ui.MUTED, max_width=0.265, max_height=0.23))
         add(ui.label(None, "КАРТА", (0.582, -0.092), scale=0.36, tint=ui.MUTED))
-        self._map_entity = add(Entity(parent=camera.ui, model="quad",
-                                      position=(0.715, -0.196, -0.03),
-                                      scale=(0.26, 0.172),
-                                      color=color.white, visible=False,
-                                      name="bench_map"))
+        self._map_entity = add(ui.panel(position=(0.715, -0.196), z=-0.03,
+                                        scale=(0.27, 0.172), tint=color.white,
+                                        name="bench_map"))
+        self._map_entity.visible = False
         self.case_proof = add(ui.label(None, "", (0.582, -0.300), scale=0.30,
-                                       tint=ui.MUTED))
+                                       tint=ui.MUTED, max_width=0.265, max_height=0.145))
 
         # bottom: protocol path
         self.status = add(ui.label(None, "", (0.0, -0.400), origin=(0.0, 0.0),
-                                   scale=0.40, tint=ui.INK))
+                                   scale=0.40, tint=ui.INK, max_width=0.75))
 
         for entity in self._entities:
             entity.enabled = False

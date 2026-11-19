@@ -11,9 +11,12 @@ import math
 import shutil
 from pathlib import Path
 
-from ursina import Button, Entity, Text, application, camera, color, mouse
+from ursina import Button, Entity, Text, Vec3, application, camera, color, mouse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DESIGN_SIZE = (1280, 720)
+DESIGN_ASPECT = DESIGN_SIZE[0] / DESIGN_SIZE[1]
+canvas: Entity | None = None
 INK = color.rgb32(232, 238, 246)
 MUTED = color.rgb32(160, 172, 188)
 ACCENT = color.rgb32(90, 170, 255)
@@ -29,6 +32,57 @@ BUTTON_OFF = color.rgb32(50, 52, 60)
 BUTTON_DANGER = color.rgb32(120, 60, 60)
 
 FONT_NAME = "arial.ttf"
+TEXT_SIZE = 0.030
+
+
+def _fit_text(text: Text, scale: float, max_width: float | None,
+              max_height: float | None) -> float:
+    if text.text_nodes:
+        if max_width is not None:
+            width = text.width
+            if width * scale > max_width:
+                scale = max_width / width
+        if max_height is not None:
+            height = text.height
+            if height * scale > max_height:
+                scale = max_height / height
+    return scale
+
+
+class CanvasLabel(Text):
+    def __init__(self, text, *, scale, max_width, max_height, **kwargs):
+        self._preferred_scale = scale
+        self._max_width = max_width
+        self._max_height = max_height
+        super().__init__(scale=scale, **kwargs)
+        self.text = text
+
+    @Text.text.setter
+    def text(self, value):
+        Text.text.fset(self, value)
+        self.scale = _fit_text(self, self._preferred_scale, self._max_width, self._max_height)
+
+
+class CanvasButton(Button):
+    def text_size_setter(self, value, temp=False):
+        if not temp:
+            self._text_size = value
+        if self.text_entity:
+            # Use UI-parent units so hovering does not undo canvas scaling.
+            scale = _fit_text(self.text_entity, value, self.scale_x * 0.88, self.scale_y * 0.85)
+            self.text_entity.setScale(self.parent, Vec3(scale))
+
+    text_size = Button.text_size.setter(text_size_setter)
+
+
+def create_canvas() -> None:
+    global canvas
+    # Ursina moves direct children when the aspect ratio changes.
+    canvas = Entity(parent=camera.ui, name="app_ui")
+
+
+def fit_canvas(aspect: float) -> None:
+    canvas.scale = min(1.0, aspect / DESIGN_ASPECT)
 
 
 def configure_fonts() -> None:
@@ -47,18 +101,20 @@ def configure_fonts() -> None:
         except OSError:
             pass
     Text.default_font = FONT_NAME
+    Text.size = TEXT_SIZE
     Text.default_resolution = 1080 * Text.size * 2
 
 
 def panel(parent=None, position=(0, 0), scale=(0.4, 0.2), tint=PANEL, z=0.2, name=""):
-    return Entity(parent=parent or camera.ui, model="quad", color=tint,
+    return Entity(parent=parent or canvas, model="quad", color=tint,
                   position=(position[0], position[1], z), scale=scale, name=name)
 
 
 def label(parent, text, position, origin=(-0.5, 0.5), scale=0.66, tint=INK,
-          background=False, z=-0.02):
-    item = Text(text=text, parent=parent or camera.ui, position=(position[0], position[1], z),
-                origin=origin, scale=scale, color=tint)
+          background=False, z=-0.02, *, max_width=None, max_height=None):
+    item = CanvasLabel(text, parent=parent or canvas, position=(position[0], position[1], z),
+                       origin=origin, scale=scale, color=tint,
+                       max_width=max_width, max_height=max_height)
     if background:
         item.background = True
         item.background.color = color.rgba32(8, 12, 20, 205)
@@ -67,11 +123,11 @@ def label(parent, text, position, origin=(-0.5, 0.5), scale=0.66, tint=INK,
 
 def button(parent, text, position, scale=(0.24, 0.046), on_click=None,
            tint=BUTTON, text_size=0.62, danger=False, name=""):
-    item = Button(parent=parent or camera.ui, model="quad", text=text,
-                  position=(position[0], position[1], -0.04), scale=scale,
-                  color=tint, text_size=text_size, text_color=INK,
-                  highlight_color=tint.tint(0.18), pressed_color=tint.tint(-0.18),
-                  radius=0.015, on_click=on_click, name=name or text)
+    item = CanvasButton(parent=parent or canvas, model="quad", text=text,
+                        position=(position[0], position[1], -0.04), scale=scale,
+                        color=tint, text_size=text_size, text_color=INK,
+                        highlight_color=tint.tint(0.18), pressed_color=tint.tint(-0.18),
+                        radius=0.015, on_click=on_click, name=name or text)
     if danger:
         item.color = BUTTON_DANGER
         item.highlight_color = BUTTON_DANGER.tint(0.18)
@@ -103,22 +159,12 @@ def pointer_over_ui() -> bool:
     return False
 
 
-def field_point_under_mouse() -> tuple[float, float] | None:
-    """Intersect the pointer ray with the field plane y=0, in field coordinates."""
-    point = getattr(mouse, "world_point", None)
-    if point is not None:
-        return float(point.x), float(point.z)
-
-    # Analytical fallback: camera ray against y=0.
-    origin = camera.world_position
-    direction = camera.forward
-    if abs(direction.y) < 1e-6:
+def field_point_under_mouse(field: Entity) -> tuple[float, float] | None:
+    """Return the pointer intersection with the field collider, in metres."""
+    if mouse.hovered_entity is not field:
         return None
-    t = -origin.y / direction.y
-    if t <= 0:
-        return None
-    hit = origin + direction * t
-    return float(hit.x), float(hit.z)
+    hit = mouse.world_point
+    return (float(hit.x), float(hit.z)) if hit is not None else None
 
 
 def clamp_field(x: float, y: float) -> tuple[float, float]:

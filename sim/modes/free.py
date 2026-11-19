@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 
-from ursina import Vec3, camera, color, held_keys, mouse
+from panda3d.core import WindowProperties
+from ursina import Vec3, camera, held_keys, mouse
 
 from shared.world import ALT_MAX, ALT_MIN, FIELD_H, FIELD_W, SPEED_LIMIT
 from sim import ui
@@ -25,7 +26,9 @@ class FreeMode(Mode):
     def __init__(self, app):
         super().__init__(app)
         self.looking = False
-        self.cursor_saved = None
+        self.cursor_saved: tuple[int, int] | None = None
+        self.look_geometry: tuple[int | None, int | None, int, int] | None = None
+        self.look_delta: tuple[float, float] | None = None
         self.obs_pos = Vec3(8.6, 5.2, -3.2)
         self.obs_yaw = 0.0
         self.obs_pitch = 0.0
@@ -56,10 +59,11 @@ class FreeMode(Mode):
             "\n"
             "Режим 1 не используется в зачётном\n"
             "сценарии: это свободный полёт.\n",
-            (-0.84, 0.305), origin=(-0.5, 0.5), scale=0.58, tint=ui.INK))
+            (-0.84, 0.305), origin=(-0.5, 0.5), scale=0.58, tint=ui.INK,
+            max_width=0.39))
         self.status = self.add_ui(ui.label(
             None, "", (-0.84, -0.30), origin=(-0.5, 0.5),
-            scale=0.60, tint=ui.WARN))
+            scale=0.60, tint=ui.WARN, max_width=0.39))
 
     # ------------------------------------------------------------------ #
     def on_enter(self) -> None:
@@ -69,7 +73,7 @@ class FreeMode(Mode):
         d = target - self.obs_pos
         self.obs_yaw = math.degrees(math.atan2(d.x, d.z))
         self.obs_pitch = -math.degrees(math.atan2(d.y, math.hypot(d.x, d.z)))
-        camera.fov = OBSERVER_FOV
+        self.app.set_observer_fov(OBSERVER_FOV)
         camera.position = self.obs_pos
         camera.rotation = (self.obs_pitch, self.obs_yaw, 0)
         self.app.scene.set_overlays(True)
@@ -81,39 +85,43 @@ class FreeMode(Mode):
         self._unlock()
         self.app.drone.stop()
 
-    def _unlock(self) -> None:
+    def _set_cursor_capture(self, active: bool) -> None:
+        # Leave geometry to the window manager. Ursina's shared properties
+        # can still contain the startup origin.
+        props = WindowProperties()
+        props.setCursorHidden(active)
+        props.setMouseMode(WindowProperties.M_confined if active else WindowProperties.M_absolute)
+        self.app.ursina.win.requestProperties(props)
+
+    def _unlock(self, restore_cursor: bool = True) -> None:
         if not self.looking:
             return
         self.looking = False
-        mouse.locked = False
-        if self.cursor_saved:
-            try:
-                base.win.movePointer(0, *self.cursor_saved)
-            except Exception:
-                pass
-            self.cursor_saved = None
+        self.look_geometry = None
+        self.look_delta = None
+        self._set_cursor_capture(False)
+        win = self.app.ursina.win
+        if restore_cursor and self.cursor_saved and win.getProperties().getForeground():
+            x, y = self.cursor_saved
+            win.movePointer(0, min(x, win.getXSize() - 1), min(y, win.getYSize() - 1))
+        self.cursor_saved = None
 
-    def _lock(self, on: bool) -> None:
-        if on == self.looking:
+    def _lock(self) -> None:
+        if self.looking or ui.pointer_over_ui():
             return
-        if on:
-            ptr = base.win.getPointer(0)
-            if ptr.in_window:
-                self.cursor_saved = (int(ptr.getX()), int(ptr.getY()))
-            self.looking = True
-            mouse.locked = True
-            mouse.position = Vec3(0, 0, 0)
-            mouse.prev_x = mouse.prev_y = 0.0
-            mouse.velocity = Vec3(0, 0, 0)
-        else:
-            self._unlock()
+        win = self.app.ursina.win
+        ptr = win.getPointer(0)
+        if not ptr.in_window or not win.getProperties().getForeground():
+            return
+        self.cursor_saved = (int(ptr.getX()), int(ptr.getY()))
+        self.looking = True
+        self._set_cursor_capture(True)
 
     def input(self, key: str) -> None:
         if key == "right mouse down":
-            if not ui.pointer_over_ui():
-                self._lock(True)
+            self._lock()
         elif key == "right mouse up":
-            self._lock(False)
+            self._unlock()
         elif key == "p":
             self.payload = not self.payload
             self.app.scene.rig.set_led(self.payload)
@@ -126,15 +134,40 @@ class FreeMode(Mode):
         self.obs_pitch -= vy * MOUSE_SENSITIVITY
         self.obs_pitch = max(-PITCH_LIMIT, min(PITCH_LIMIT, self.obs_pitch))
 
+    def update_frame(self) -> None:
+        if not self.looking:
+            return
+        win = self.app.ursina.win
+        props = win.getProperties()
+        if not props.getForeground() or props.getMinimized() or not mouse.right:
+            self._unlock(restore_cursor=False)
+            return
+        width, height = win.getSize()
+        if width <= 0 or height <= 0:
+            return
+        center_x, center_y = width // 2, height // 2
+        x, y = props.getOrigin() if props.hasOrigin() else (None, None)
+        geometry = (x, y, width, height)
+        if self.look_geometry != geometry:
+            self.look_delta = None
+            if win.movePointer(0, center_x, center_y):
+                self.look_geometry = geometry
+            return
+        ptr = win.getPointer(0)
+        if not ptr.in_window:
+            self._unlock(restore_cursor=False)
+            return
+        if self.look_delta is not None:
+            self._apply_look(*self.look_delta)
+        self.look_delta = None
+        dx, dy = ptr.getX() - center_x, center_y - ptr.getY()
+        # The pointer can reflect a resize one frame before Panda reports it.
+        # Commit the movement only if the geometry stayed stable.
+        if (dx or dy) and win.movePointer(0, center_x, center_y):
+            self.look_delta = (dx / height, dy / height)
+
     def step(self, dt: float) -> None:
         drone = self.app.drone
-        if self.looking:
-            vx, vy = mouse.velocity[0], mouse.velocity[1]
-            if vx or vy:
-                self._apply_look(vx, vy)
-        elif mouse.right:
-            self._lock(True)
-
         yaw_r = math.radians(self.obs_yaw)
         pitch_r = math.radians(self.obs_pitch)
         forward = Vec3(math.sin(yaw_r) * math.cos(pitch_r),
@@ -162,7 +195,6 @@ class FreeMode(Mode):
             self.obs_pos.z = max(-25.0, min(FIELD_H + 25.0, self.obs_pos.z))
         camera.position = self.obs_pos
         camera.rotation = (self.obs_pitch, self.obs_yaw, 0)
-        camera.fov = OBSERVER_FOV
 
         cmd = Vec3(0, 0, 0)
         if held_keys["t"]:

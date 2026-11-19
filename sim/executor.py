@@ -22,7 +22,7 @@ import math
 from datetime import datetime
 from pathlib import Path
 
-from cv.planner import plan
+from cv.planner import plan, safe_leg
 from cv.validator import operation_gate, validate_mission
 from shared.contracts import iso, parse_iso, read_json, utc_now, write_json
 from shared.frames import LocalFrame
@@ -72,12 +72,15 @@ class ExecutorRun:
                  registry_path: str | Path | None = None,
                  journal: Journal | None = None,
                  faults: dict | None = None,
-                 known_calibrations: set[str] | None = None):
+                 known_calibrations: set[str] | None = None, *,
+                 start: tuple[float, float] = HOME):
         self.drone = drone
         self.mission_path = Path(mission_path)
         self.run_dir = Path(run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.frame = frame or LocalFrame.from_spec("L_exec")
+        self.start = start
+        self.home_l = self.frame.to_local(*start)
         self.registry = ActionRegistry(registry_path or REGISTRY_PATH)
         self.journal = journal or Journal(self.run_dir / "journal.jsonl")
         self._own_journal = journal is None
@@ -126,12 +129,13 @@ class ExecutorRun:
         self.abort_reason: str | None = None
         self.abort_mode: str | None = None
         self.abort_point: tuple[float, float] | None = None
+        self.abort_waypoints: list[tuple[float, float]] = []
         self.led_interruptions: list[dict] = []
         self.uncertain_actions: list[str] = []
 
         self._load()
         if not self.failed:
-            self.drone.reset()
+            self.drone.reset(self.start)
             self.drone.speed_limit = SPEED_LIMIT
             self._goto_route()
 
@@ -151,7 +155,8 @@ class ExecutorRun:
         if self.mission.get("budget_s") is not None:
             self.budget_s = float(self.mission["budget_s"])
         try:
-            self.plan = plan(HOME, self.mission["targets"], forbidden=None)
+            self.plan = plan(self.start, self.mission["targets"],
+                             forbidden=_zone_vertices(self.mission))
         except Exception as exc:
             self._fail(f"планировщик: {exc}")
             return
@@ -176,6 +181,7 @@ class ExecutorRun:
         self.journal.log("mission_loaded", mission_id=self.mission.get("mission_id"),
                          mission_path=str(self.mission_path), targets=len(self.plan["targets"]),
                          route_points=len(self.route_f), local_frame=self.frame.name,
+                         start_f=dict(zip(("x", "y"), self.start)),
                          budget_s=self.budget_s, reserve_s=round(self.reserve_s, 1),
                          uncertain_actions=self.uncertain_actions)
 
@@ -246,12 +252,10 @@ class ExecutorRun:
     def _goto_route(self) -> None:
         if self.route_index >= len(self.route_l):
             self.phase = "to_home"
-            fx, fy = HOME
-            self.drone.goto(fx, fy, ALT_NOMINAL)
+            self.drone.goto(*self.frame.to_field(*self.home_l), ALT_NOMINAL)
             self._arrival_handled = False
             return
-        fx, fy = self.route_f[self.route_index]
-        self.drone.goto(fx, fy, ALT_NOMINAL)
+        self.drone.goto(*self.frame.to_field(*self.route_l[self.route_index]), ALT_NOMINAL)
         self.phase = "cruise"
         self._arrival_handled = False
 
@@ -263,8 +267,7 @@ class ExecutorRun:
 
     def _start_land(self) -> None:
         self.phase = "land"
-        fx, fy = HOME
-        self.drone.goto(fx, fy, 0.05, landing=True)
+        self.drone.goto(*self.frame.to_field(*self.home_l), 0.05, landing=True)
         self.journal.log("landing_started", t_s=round(self.t, 2),
                          x=round(self.drone.x, 3), y=round(self.drone.y, 3))
 
@@ -350,8 +353,14 @@ class ExecutorRun:
             return
         self.aborted = True
         self.abort_reason = reason
-        self.abort_mode = mode
         self.abort_point = (self.drone.x, self.drone.y)
+        if mode == "home":
+            path = safe_leg(self.abort_point, self.start, _zone_vertices(self.mission))
+            if path is None:
+                mode = "land"
+            else:
+                self.abort_waypoints = path[1:]
+        self.abort_mode = mode
         self.drone.rig.set_led(False)
         self.led_time = 0.0
         action = self.current_action
@@ -378,7 +387,7 @@ class ExecutorRun:
                              x=round(self.drone.x, 3), y=round(self.drone.y, 3))
         else:
             self.phase = "abort_home"
-            self.drone.goto(*HOME, ALT_NOMINAL)
+            self.drone.goto(*self.abort_waypoints.pop(0), ALT_NOMINAL)
         self._arrival_handled = False
 
     def _finish_abort(self) -> None:
@@ -397,12 +406,13 @@ class ExecutorRun:
         if self.phase in {"abort_home", "emergency_land"}:
             self.drone.update(dt)
             if self.phase == "abort_home":
-                if self.drone.arrived and self.drone.alt_reached and not self._arrival_handled:
-                    self._arrival_handled = True
-                    self.journal.log("abort_home_arrived", t_s=round(self.t, 3),
-                                     x=round(self.drone.x, 3), y=round(self.drone.y, 3))
-                    self.phase = "land"
-                    self.drone.goto(HOME[0], HOME[1], 0.05, landing=True)
+                if self.drone.arrived and self.drone.alt_reached:
+                    if self.abort_waypoints:
+                        self.drone.goto(*self.abort_waypoints.pop(0), ALT_NOMINAL)
+                    else:
+                        self.journal.log("abort_home_arrived", t_s=round(self.t, 3),
+                                         x=round(self.drone.x, 3), y=round(self.drone.y, 3))
+                        self._start_land()
                 return
             if self.drone.alt <= 0.06:
                 self._finish_abort()
@@ -641,6 +651,9 @@ class ExecutorRun:
             "status_counts": self._status_counts(),
             "validation_errors": self.validation_errors,
             "local_frame": self.frame.name,
+            "start_f": dict(zip(("x", "y"), self.start)),
+            "local_frame_origin_f": dict(zip(("x", "y"), self.frame.origin)),
+            "final_position_f": {"x": round(self.drone.x, 4), "y": round(self.drone.y, 4)},
             "route": [{"x": round(x, 4), "y": round(y, 4)} for x, y in self.route_f],
             "actions": self.actions,
             "journal": str(self.run_dir / "journal.jsonl"),
